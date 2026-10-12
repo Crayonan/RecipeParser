@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [9.10.0] — 2026-10-12
+
+Ingredient section headings ("For the sauce:") are marked, not dropped (Cayenne ingredient headings, D1-D3). Needs no migration.
+
+### ✨ Added
+- REFINE gives every ingredient line exactly one entry and marks each with `kind`: `"heading"` for a line that names a part of the recipe and lists nothing to buy, `"ingredient"` otherwise. A heading has its words as `name`, the line as `fallback_string`, and no amount, unit or state.
+- The mentions prompt marks heading lines `(heading)` and forbids naming one as a mention.
+- A Cayenne-flavoured Paprika archive exported before 9.10.0 has no `kind`; it no longer restores instantly and goes through REFINE instead (new ids).
+
 ## [9.9.1] — 2026-10-11
 
 *Apply to existing recipes* tags in the import's batches (Cayenne Fix Roadmap F-256). Needs no migration; the container restart deploys it.
