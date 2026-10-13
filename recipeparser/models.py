@@ -188,7 +188,8 @@ class TokenizedDirection(BaseModel):
     text: str = Field(
         description=(
             "Direction text with Fat Tokens {{id|words|use}}: words exactly as written, use one of "
-            "all, rest, none, or an amount such as '0.5 cup'."
+            "all, rest, none, or an amount such as '0.5 cup'; and temperature tokens "
+            "{{temp:VALUE|words}}, VALUE such as '180C,oven,fan=160C', '350F' or 'gas4'."
         )
     )
 
@@ -208,6 +209,19 @@ class DirectionMention(BaseModel):
 class DirectionMentions(BaseModel):
     """The re-tagging pass's whole answer for one recipe."""
     mentions: List[DirectionMention] = Field(default_factory=list)
+
+
+class TemperatureMention(BaseModel):
+    """One temperature in a direction step, as the temperature backfill reports it (Cayenne oven temperatures)."""
+    step: int = Field(description="1-based number of the step the temperature is in.")
+    quote: str = Field(description="The words to wrap, copied exactly from that step.")
+    context: str = Field(default="", description="The quote with about five words around it, copied exactly from the step.")
+    value: str = Field(description="What the writer meant: '180C,oven', '350F', 'gas4', '180C,oven,fan=160C'.")
+
+
+class TemperatureMentions(BaseModel):
+    """The temperature backfill's whole answer for one recipe."""
+    mentions: List[TemperatureMention] = Field(default_factory=list)
 
 
 class CayenneRefinement(BaseModel):

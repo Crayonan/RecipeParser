@@ -27,7 +27,15 @@ from recipeparser.config import (
     THINKING_LEVEL,
 )
 from recipeparser.exceptions import ExtractionParseError
-from recipeparser.models import CayenneRefinement, DirectionMention, DirectionMentions, RecipeList, StructuredIngredient
+from recipeparser.models import (
+    CayenneRefinement,
+    DirectionMention,
+    DirectionMentions,
+    RecipeList,
+    StructuredIngredient,
+    TemperatureMention,
+    TemperatureMentions,
+)
 
 if TYPE_CHECKING:
     from recipeparser.core.rate_limiter import GlobalRateLimiter
@@ -774,6 +782,24 @@ RULES:
        "Add about 1/2 cup (60 g) flour" -> "Add about {{{{ing_02|1/2 cup (60 g)|0.5 cup}}}} flour"
        "Add the remaining flour" -> "Add the remaining {{{{ing_02|flour|rest}}}}"
        "Add more flour until sticky" -> "Add more {{{{ing_02|flour|none}}}} until sticky"
+   - TEMPERATURES: wrap every temperature a direction states - an oven, a grill, frying oil, sugar,
+     water, proving, a core temperature ("until the centre reads 63°C"), a fridge or a freezer - in a
+     temperature token {{{{temp:VALUE|words}}}}. The words are the direction's own, copied exactly,
+     and the whole run when it gives one setting several ways: "180°C/160°C fan/gas mark 4" is ONE
+     token. VALUE is what the writer meant, in the writer's own unit:
+       * the figure: a number and C or F ("180C", "350F"), or a Gas Mark ("gas4", "gas0.5", "gas0.25");
+       * then ",oven" when it is an oven setting (bake, roast, preheat, a described oven);
+       * then ",fan=160C" (or F) when the writer also gives the fan-oven figure;
+       * "fan=160C" alone when the writer gives only a fan-oven figure.
+     A number with no unit ("bake at 180") or a described oven: decide from the recipe and its
+     SOURCE SYSTEM; a described oven is slow 150C, moderate 180C, hot 220C, very hot 230C, each
+     with ",oven". Never wrap a range ("170-180°C") or words with no figure ("room temperature",
+     "warm", "lukewarm").
+   - Examples:
+       "Preheat the oven to 350°F" -> "Preheat the oven to {{{{temp:350F,oven|350°F}}}}"
+       "Bake at 180°C/160°C fan/gas mark 4" -> "Bake at {{{{temp:180C,oven,fan=160C|180°C/160°C fan/gas mark 4}}}}"
+       "Heat the oil to 180C" -> "Heat the oil to {{{{temp:180C|180C}}}}"
+       "Bake in a moderate oven" -> "Bake in a {{{{temp:180C,oven|moderate oven}}}}"
 
 3. PHASES:
    - If the raw recipe groups its ingredients or directions into phases,
@@ -940,6 +966,59 @@ def tag_direction_mentions(
     if not response.text or not response.text.strip():
         raise RuntimeError("tag_direction_mentions(): Gemini returned an empty response")
     return DirectionMentions.model_validate(json.loads(response.text)).mentions
+
+
+def build_temperatures_prompt(steps: List[str], source_system: Optional[str]) -> str:
+    """The temperature backfill's prompt (Cayenne oven temperatures design): steps the deterministic
+    splice could not settle - a bare figure, or a described oven. The answer is quotes, placed by
+    ``core.temperatures.place_temperature_mentions``, so no word of a step changes."""
+    numbered = "\n".join(f"  {n}. {text}" for n, text in enumerate(steps, start=1))
+    return f"""
+You are a culinary data refiner. Find every temperature these recipe directions state that is not
+already written with its unit, and say what the writer meant.
+
+RULES:
+   - Report only a figure with no unit ("bake at 180", "350 degrees") or a described oven ("a
+     moderate oven", "a hot oven"). Skip anything inside {{{{ }}}} and anything with a unit already.
+   - "quote" is the words to wrap, copied character for character from that step; "context" is the
+     quote with about five words around it, copied the same way.
+   - "value" is what the writer meant, in the writer's unit: a number and C or F ("180C", "350F"),
+     then ",oven" when it is an oven setting. Decide the unit from the SOURCE SYSTEM and the figure:
+     US recipes write Fahrenheit; UK, EU and AU recipes write Celsius; an oven figure above 260 is
+     Fahrenheit. A described oven is slow 150C, moderate 180C, hot 220C, very hot 230C, each with ",oven".
+   - Never report a range ("170-180"), a time, a weight, a size or a count.
+   - When unsure, leave it out.
+
+SOURCE SYSTEM: {source_system or "unknown"}
+
+DIRECTIONS:
+{numbered}
+"""
+
+
+def tag_temperatures(
+    steps: List[str],
+    source_system: Optional[str],
+    client,
+    *,
+    limiter: Optional["GlobalRateLimiter"] = None,
+) -> List[TemperatureMention]:
+    """Every unit-less temperature in ``steps``, from one Gemini call. Raises on failure: the backfill
+    decides whether a recipe it could not ask about is skipped."""
+    response = _call_with_retry(
+        client,
+        model=GEMINI_MODEL,
+        contents=build_temperatures_prompt(steps, source_system),
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": _schema_for_gemini(TemperatureMentions),
+        },
+        what="Temperatures",
+        limiter=limiter,
+    )
+    if not response.text or not response.text.strip():
+        raise RuntimeError("tag_temperatures(): Gemini returned an empty response")
+    return TemperatureMentions.model_validate(json.loads(response.text)).mentions
 
 
 class _RecipeTags(BaseModel):
