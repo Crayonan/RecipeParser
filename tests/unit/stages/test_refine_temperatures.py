@@ -46,17 +46,27 @@ def test_an_out_of_range_value_is_unwrapped():
     assert result.tokenized_directions[0].text == "Preheat the oven to 350°F."
 
 
+def test_a_tin_token_is_not_an_unknown_ingredient():
+    from recipeparser.models import PanDims, RecipePan
+
+    pan = RecipePan(id="pan_01", raw="two 20cm tins", count=2, shape="round", family="round-cake",
+                    dims_mm=PanDims(d=200))
+    result = _run_with(["Grease the two 20cm tins and preheat."],
+                       ["Grease the {{pan_01|two 20cm tins}} and preheat."], pans=[pan])
+    assert result.tokenized_directions[0].text == "Grease the {{pan_01|two 20cm tins}} and preheat."
+
+
 def test_an_unknown_ingredient_id_still_raises():
     import pytest
     with pytest.raises(ValueError, match="unknown ingredient"):
         _run(["Add {{ing_09|sugar|all}}.", "Roast."])
 
 
-def _run_with(raw_steps, steps):
+def _run_with(raw_steps, steps, pans=()):
     from recipeparser.core.stages.refine import refine
     raw = RecipeExtraction(name="Roast", ingredients=["1 cup flour"], directions=raw_steps)
     refinement = CayenneRefinement(
-        title="Roast", base_servings=4, structured_ingredients=[FLOUR],
+        title="Roast", base_servings=4, structured_ingredients=[FLOUR], pans=list(pans),
         tokenized_directions=[TokenizedDirection(step=n, text=t) for n, t in enumerate(steps, 1)],
     )
     with patch("recipeparser.core.stages.refine.refine_recipe_for_cayenne", return_value=refinement):

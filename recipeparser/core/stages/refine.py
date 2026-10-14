@@ -11,9 +11,17 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from recipeparser.core.fat_tokens import TEMP_PREFIX, TOKEN_RE, check_mentions, is_temp_id, parse_temp_value
+from recipeparser.core.fat_tokens import (
+    TEMP_PREFIX,
+    TOKEN_RE,
+    check_mentions,
+    is_special_id,
+    is_temp_id,
+    parse_temp_value,
+)
 from recipeparser.core.headings import heading_name
 from recipeparser.core.numbers import written_measures
+from recipeparser.core.pans import apply_pan_checks, check_core_flags
 from recipeparser.core.rate_limiter import GlobalRateLimiter
 from recipeparser.core.temperatures import repair_tokens
 from recipeparser.gemini import refine_recipe_for_cayenne
@@ -154,8 +162,8 @@ def _validate_fat_tokens(refinement: CayenneRefinement) -> None:
     valid_ids = {ing.id for ing in refinement.structured_ingredients}
     for step in refinement.tokenized_directions:
         for match in TOKEN_RE.finditer(step.text):
-            if is_temp_id(match.group(1)):
-                continue  # checked by _check_temperatures
+            if is_special_id(match.group(1)):
+                continue  # a temperature is checked by _check_temperatures; a tin names no ingredient
             token_id = match.group(1)
             if token_id not in valid_ids:
                 raise ValueError(
@@ -530,7 +538,13 @@ def refine(
     _ensure_unique_ids(result)
     _normalise_headings(result)
     _unwrap_heading_tokens(result)
+    # R-B: strip a misplaced ",core" first, or _check_temperatures unwraps the whole token.
+    result.tokenized_directions, core_warnings = check_core_flags(result.tokenized_directions)
+    for line in core_warnings:
+        log.warning("refine(): '%s': %s", result.title, line)
     _check_temperatures(result, raw)
+    for line in apply_pan_checks(result, raw.directions):
+        log.warning("refine(): '%s': %s", result.title, line)
     _validate_fat_tokens(result)
     _check_mentions(result)
     _normalise_line_index(result, raw)
