@@ -384,6 +384,43 @@ class TestPipelineRun:
 # Test: on_result / on_skip streaming callbacks (Task 3)
 # ---------------------------------------------------------------------------
 
+def _skip_chunk() -> Chunk:
+    return Chunk(
+        text="",
+        input_type=InputType.PAPRIKA_CAYENNE,
+        skip_reason="Bad Cake: the Cayenne data in this entry could not be read",
+        label="Bad Cake",
+    )
+
+
+def test_skip_reason_chunk_runs_no_stage_and_reports_skip():
+    pipeline = _make_pipeline()
+    results_seen: List[IngestResponse] = []
+    skips_seen: List[tuple] = []
+
+    returned = pipeline.run(
+        [_skip_chunk()],
+        on_result=lambda r, _ai: results_seen.append(r),
+        on_skip=lambda chunk, reason, index: skips_seen.append((reason, index)),
+    )
+
+    assert skips_seen == [("Bad Cake: the Cayenne data in this entry could not be read", 0)]
+    assert results_seen == []
+    assert returned == []
+    pipeline._client.models.embed_content.assert_not_called()
+    pipeline._client.models.generate_content.assert_not_called()
+    assert pipeline._client.mock_calls == []
+
+
+def test_skip_reason_chunk_needs_no_ai():
+    from recipeparser.core.pipeline import chunk_calls_ai, chunk_needs_ai, chunk_stages
+
+    chunk = _skip_chunk()
+    assert chunk_stages(chunk) == []
+    assert chunk_needs_ai(chunk) is False
+    assert chunk_calls_ai(chunk) is False
+
+
 def test_on_result_fires_per_recipe_and_on_skip_names_the_failed_chunk():
     """Spec 4.2, 4.3: results stream out as they finish and failures are reported, not swallowed."""
     good = Chunk(text="good", input_type=InputType.URL, label="Good One")
@@ -491,7 +528,7 @@ class _FakeImageStore(ImageStore):
 
 def _assemble_reflecting_image_url(
     *, recipe, embedding, source_url, image_url, grid_categories, prep_time, cook_time, meta=None,
-    ingredient_lines=None, direction_steps=None, servings_text=None, citation=None
+    ingredient_lines=None, direction_steps=None, servings_text=None, citation=None, **_
 ):
     """Stand-in for the real ``assemble`` stage: echoes the image_url it was
     actually called with, so a test can prove the URL travels all the way
@@ -1082,3 +1119,125 @@ def test_a_recipe_on_result_declines_is_not_tagged():
                          on_tags=lambda r: tagged.append(r.title))
     assert tagged == ["recipe 0", "recipe 2"]
     assert all("recipe 1" not in titles for titles, _a, _p in tagger.calls)
+
+
+# --- Cayenne restore (plan B task 3) -----------------------------------------
+
+
+def _restore_chunk(**over) -> Chunk:
+    from recipeparser.models import CayenneRecipe
+
+    fields = dict(
+        title="grandma's best scones",
+        base_servings=6,
+        structured_ingredients=_make_refinement().structured_ingredients,
+        tokenized_directions=_make_refinement().tokenized_directions,
+    )
+    fields.update(over)
+    return Chunk(
+        text="",
+        input_type=InputType.PAPRIKA_CAYENNE,
+        pre_parsed=CayenneRecipe(**fields),
+        pre_parsed_embedding=FAKE_EMBEDDING,
+    )
+
+
+def test_restore_keeps_title_and_uom():
+    chunk = _restore_chunk(source_uom_system_detected="UK", source_uom_system_evidence="caster sugar")
+    result = _make_pipeline()._process_chunk(chunk, ["ASSEMBLE"]).results[0]
+    assert result.title == "grandma's best scones"
+    assert result.source_uom_system_detected == "UK"
+    assert result.source_uom_system_evidence == "caster sugar"
+
+
+def test_restore_keeps_title_on_the_embed_path_too():
+    chunk = _restore_chunk(source_uom_system_detected="UK")
+    chunk.pre_parsed_embedding = None
+    with patch("recipeparser.core.pipeline.embed", return_value=FAKE_EMBEDDING):
+        result = _make_pipeline()._process_chunk(chunk, ["EMBED", "ASSEMBLE"]).results[0]
+    assert result.title == "grandma's best scones"
+    assert result.source_uom_system_detected == "UK"
+
+
+def test_restore_carries_restore_fields_and_spans():
+    chunk = _restore_chunk(
+        is_favourite=True, source_uom_system="UK", image_source="generated", stale=True,
+        servings_min=10, servings_max=12, servings_note="cakes", base_servings=10,
+        prep_min_minutes=30, prep_max_minutes=45, prep_note="overnight",
+    )
+    r = _make_pipeline()._process_chunk(chunk, ["ASSEMBLE"]).results[0]
+    assert (r.is_favourite, r.source_uom_system, r.image_source, r.stale) == (True, "UK", "generated", True)
+    assert (r.servings_min, r.servings_max, r.servings_note, r.base_servings) == (10, 12, "cakes", 10)
+    assert (r.prep_min_minutes, r.prep_max_minutes, r.prep_note) == (30, 45, "overnight")
+
+# --- Cayenne restore pictures (plan B task 5) --------------------------------
+
+_OLD_BUCKET_URL = "https://old.supabase.co/storage/v1/object/public/recipe-images/abc.jpg?v=1"
+
+
+def _restore_pipeline(client, store):
+    from recipeparser.io.writers.picture_copy import BucketPictures
+
+    GlobalRateLimiter().reset()
+    return RecipePipeline(
+        client=MagicMock(), controller=PipelineController(), category_source=_FakeCategorySource(),
+        rpm=9999, image_store=store, picture_source=BucketPictures("https://old.supabase.co", client),
+        categorize_fn=lambda rows, axes, client, parents=None, limiter=None: {},
+    )
+
+
+def _picture_client(data=b"picbytes", error=None):
+    client = MagicMock()
+    bucket = client.storage.from_.return_value
+    if error:
+        bucket.download.side_effect = error
+    else:
+        bucket.download.return_value = data
+    return client
+
+
+def test_restore_without_photo_data_copies_bucket_picture():
+    store = _FakeImageStore()
+    chunk = _restore_chunk(image_url=_OLD_BUCKET_URL)
+    skipped: list = []
+    results = _restore_pipeline(_picture_client(), store).run([chunk], on_skip=skipped.append)
+    assert store.calls == [b"picbytes"]
+    assert results[0].image_url == "https://example.test/stored.jpg"
+    assert skipped == []
+
+
+def test_restore_picture_copy_failure_drops_old_url(caplog):
+    import logging
+
+    store = _FakeImageStore()
+    chunk = _restore_chunk(image_url=_OLD_BUCKET_URL, image_source="generated")
+    skipped: list = []
+    with caplog.at_level(logging.WARNING):
+        results = _restore_pipeline(_picture_client(error=RuntimeError("gone")), store).run(
+            [chunk], on_skip=skipped.append)
+    assert len(results) == 1
+    assert results[0].image_url is None
+    assert results[0].image_source is None
+    assert skipped == []
+    assert store.calls == []
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_restore_keeps_a_foreign_image_url():
+    store = _FakeImageStore()
+    client = _picture_client()
+    chunk = _restore_chunk(image_url="https://example.com/p.jpg")
+    results = _restore_pipeline(client, store).run([chunk])
+    assert results[0].image_url == "https://example.com/p.jpg"
+    client.storage.from_.assert_not_called()
+
+
+def test_restore_with_embedded_bytes_does_not_download():
+    store = _FakeImageStore()
+    client = _picture_client()
+    chunk = _restore_chunk(image_url=_OLD_BUCKET_URL)
+    chunk.image_bytes = b"embedded"
+    results = _restore_pipeline(client, store).run([chunk])
+    assert store.calls == [b"embedded"]
+    client.storage.from_.assert_not_called()
+    assert results[0].image_url == "https://example.test/stored.jpg"

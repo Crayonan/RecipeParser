@@ -5,6 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [9.16.0] — 2026-10-16
+
+Lossless Cayenne restore (Cayenne spec `docs/superpowers/specs/2026-10-16-paprika-export-design.md` in IanDBallard/Cayenne, plan B). A `.paprikarecipes` file exported by Cayenne now restores into a fresh account exactly as it was written, with no AI call and no allowance spent. Merging deploys (container restart); deploy before the owner's restore check (export, then restore into a fresh account, with no AI usage recorded). It can merge before or after the Cayenne client PR: older clients never send version 2.
+
+### ✨ Added
+- `_cayenne_meta` version 2 restore fields on `CayenneRecipe`: `is_favourite`, `category_paths`, `source_uom_system`, `image_source`, `stale`; `RecipePan.removed`. Version 1 entries still read.
+- Category creation: a restore creates the category paths the new account lacks, level by level, reusing a name that exists anywhere (`restore_paths.py`). A category-creation failure logs and continues; the recipes still import, linked by leaf name.
+- Picture copy: a bucket picture is downloaded from the old address and stored in the new account (`picture_copy.py`).
+
+### 🐛 Fixed
+- The cook's title is kept as written, not title-cased.
+- For version 2 entries, the nine time spans and the base servings are restored as exported, not re-derived. A pre-v2 archive still re-derives them from the recipe text.
+- The measuring system (`source_uom_system`) and `image_source` are written to their columns.
+- Removed tins are no longer revived: `removed` is kept out of both Gemini schemas (`schema_without_client_fields`; see the Cayenne spec above).
+- Stale rows restore stale (`body_rev` 1, `derived_rev` 0).
+
+### ⚠️ Changed
+- A corrupt `_cayenne_meta` entry is skipped, not re-extracted: it is one skipped line, never sent to the AI pipeline (see the Cayenne spec above). Embeddings are kept only when exactly 1536 finite numbers.
+- A failed picture copy (log warning, old address dropped) and a category path too deep (reported as a refused link) are not skipped lines, so the client does not read them as "a section that produced no recipe". A failed copy also clears `image_source`, so a row is never left with no picture but a `generated` source.
+- `category_paths` and `stale` read `null` as `[]` and `false`, so a v2 entry carrying null is restored rather than skipped.
+- A restore cleans category path names in one shared helper (strip, drop empty) for both the creation and the link lookup, so a padded name still links.
+- The bucket-picture source (a Supabase client) is built only for a job that has a Cayenne restore chunk; URL and EPUB jobs never build it.
+
+---
+
 ## [9.15.0] — 2026-10-16
 
 Households (Cayenne spec `2026-10-01-household-shopping-design.md`, Part 3; plan `2026-10-14-household-stage-3b-recipeparser.md`). Six endpoints let a household of Cayenne accounts share one shopping list. Each is one JWT-verified call to one Cayenne database function, which is the transaction.

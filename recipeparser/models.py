@@ -266,6 +266,8 @@ class RecipePan(BaseModel):
     )
     # Set by a person editing the tin; the model is never asked for it (stripped from its schema).
     edited: bool = False
+    # Set by a person removing the tin, kept so a restore round-trips it; stripped from the model's schema too.
+    removed: bool = False
 
 
 _BAKE_TYPE_DESC = (
@@ -374,6 +376,23 @@ class CayenneRecipe(BaseModel):
     pans: List[RecipePan] = Field(default_factory=list)
     bake_type: Optional[str] = None
     bake_step: Optional[int] = None
+    # _cayenne_meta version 2 (Paprika export): read back by a restore, never asked of the model.
+    is_favourite: Optional[bool] = None
+    category_paths: List[List[str]] = Field(default_factory=list)
+    source_uom_system: Optional[str] = None
+    image_source: Optional[str] = None
+    stale: bool = False
+
+    @field_validator("category_paths", mode="before")
+    @classmethod
+    def _null_paths_are_empty(cls, v):
+        return [] if v is None else v
+
+    @field_validator("stale", mode="before")
+    @classmethod
+    def _null_stale_is_false(cls, v):
+        return False if v is None else v
+
     # Raw, user-owned body (spec 3.2). Empty lists on legacy objects; the writer
     # and regen worker derive them from the structured data when empty.
     ingredient_lines: List[str] = Field(default_factory=list)

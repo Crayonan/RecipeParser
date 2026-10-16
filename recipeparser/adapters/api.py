@@ -76,7 +76,8 @@ from recipeparser.io.readers.url import PAGE_USER_AGENT as _PAGE_USER_AGENT
 from recipeparser.io.readers.url import PageMeta, UrlReader, looks_like_badge, page_meta_from_html
 from recipeparser.io.readers.url import is_unsafe_fetch_target as _is_unsafe_fetch_target
 from recipeparser.io.writers.image_store import SupabaseImageStore
-from recipeparser.io.writers.supabase import write_recipe_to_supabase
+from recipeparser.io.category_sources.restore_paths import clean_path, ensure_category_paths, restore_grid
+from recipeparser.io.writers.supabase import _get_creds, write_recipe_to_supabase
 from recipeparser.logging_setup import configure_logging
 
 # Before the first logger call in this module: uvicorn leaves the root logger
@@ -696,6 +697,15 @@ def _get_supabase_service_client() -> Any:
     return create_client(supabase_url, supabase_key)
 
 
+def _picture_source() -> Any:
+    """The bucket-picture source a Cayenne restore copies pictures with, or None without credentials."""
+    client = _get_supabase_service_client()
+    if client is None:
+        return None
+    from recipeparser.io.writers.picture_copy import BucketPictures
+    return BucketPictures(os.environ.get("SUPABASE_URL", ""), client)
+
+
 def _create_ingestion_job(
     job_id: str,
     user_id: str,
@@ -1039,6 +1049,77 @@ def _select_reader(filename: str, content_type: str) -> str:
 # The ingestion job both job endpoints start
 # ---------------------------------------------------------------------------
 
+def _create_restore_categories(user_id: str, chunks: List[Chunk]) -> Dict[str, List[Tuple[str, str]]]:
+    """Create the categories a Cayenne restore needs and point each chunk at its leaves.
+
+    Reads every ``_cayenne_meta`` category path, creates the missing nodes, then replaces the
+    chunk's ``grid_categories`` with the leaves that were placed, so the writer's junction write
+    links them by name. A v1 archive (no non-empty path) is left alone. A failure creating them
+    is logged and the restore goes on: the leaves are linked by name wherever they already exist.
+
+    Returns, by recipe title, the ``(leaf, reason)`` of each path that depth cut short, for the
+    job to report as a refused link on that recipe (never a skipped line).
+    """
+    wanted = []
+    for chunk in chunks:
+        raw = getattr(chunk.pre_parsed, "category_paths", None)
+        if chunk.input_type != InputType.PAPRIKA_CAYENNE or not isinstance(raw, list):
+            continue
+        paths = [clean_path(p) for p in raw if isinstance(p, (list, tuple))]
+        paths = [p for p in paths if p]
+        if paths:
+            wanted.append((chunk, paths))
+    if not wanted:
+        return {}
+    try:
+        url, key = _get_creds()
+        placed = ensure_category_paths(
+            user_id, [p for _, ps in wanted for p in ps], supabase_url=url, service_key=key,
+        )
+    except Exception:
+        logger.warning(
+            "Restore: could not create the categories for user %s; linking those that exist.",
+            user_id, exc_info=True,
+        )
+        placed = {p: p[-1] for _, ps in wanted for p in ps}
+    too_deep: Dict[str, List[Tuple[str, str]]] = {}
+    for chunk, paths in wanted:
+        names = []
+        for path in paths:
+            name = placed.get(path)
+            if name is None:
+                continue
+            names.append(name)
+            if name != path[-1]:
+                note = (path[-1], f"category '{path[-1]}' is nested too deep to restore")
+                notes = too_deep.setdefault(chunk.pre_parsed.title, [])
+                if note not in notes:
+                    notes.append(note)
+        chunk.pre_parsed.grid_categories = restore_grid(names)
+    return too_deep
+
+
+def _reporting_deep_paths(
+    write: Callable[..., Any], too_deep: Dict[str, List[Tuple[str, str]]],
+) -> Callable[..., Any]:
+    """Wrap the recipe writer so a too-deep note reaches the job through ``on_link_refused``.
+
+    The notes are keyed by recipe title and go out right after that recipe is written, so the
+    sink's count and log name the recipe whose path was cut.
+    """
+    pending = {t: list(n) for t, n in too_deep.items()}
+
+    def _write(recipe: Any, user_id: str, **kwargs: Any) -> Any:
+        result = write(recipe, user_id, **kwargs)
+        refuse = kwargs.get("on_link_refused")
+        for leaf, reason in pending.pop(getattr(recipe, "title", None), []):
+            if refuse is not None:
+                refuse({"category_id": leaf, "reason": reason})
+        return result
+
+    return _write
+
+
 async def _run_ingestion_job(
     job_id: str,
     user_id: str,
@@ -1071,13 +1152,14 @@ async def _run_ingestion_job(
             if gate_after_read:
                 await asyncio.to_thread(_check_ai_after_read, user_id, chunks)
 
+            too_deep = await asyncio.to_thread(_create_restore_categories, user_id, chunks)
             category_source = SupabaseCategorySource()
             category_ids = category_source.load_category_ids(user_id)
             sink = JobSink(
                 job_id=job_id,
                 user_id=user_id,
                 category_ids=category_ids,
-                write=write_recipe_to_supabase,
+                write=_reporting_deep_paths(write_recipe_to_supabase, too_deep),
                 consume=_ai_gate.consume_recipe,
                 on_cap=controller.request_cancel,
             )
@@ -1104,6 +1186,9 @@ async def _run_ingestion_job(
                 controller=controller,
                 category_source=category_source,
                 image_store=SupabaseImageStore(),
+                picture_source=_picture_source() if any(
+                    c.input_type == InputType.PAPRIKA_CAYENNE for c in chunks
+                ) else None,
             )
             await asyncio.to_thread(_update_total_chunks, job_id, len(chunks), _source_key_of(chunks))
             await asyncio.to_thread(
