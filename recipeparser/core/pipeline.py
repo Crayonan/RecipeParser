@@ -16,6 +16,7 @@ TID rule: this module lives in ``core/`` and therefore MUST NOT import from
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import mimetypes
 import os
@@ -58,6 +59,32 @@ class _ChunkFailed(Exception):
         self.cause = cause
         self.skipped = skipped
 
+
+def chunk_stages(chunk: Chunk) -> List[str]:
+    """The ordered stage names to run for ``chunk`` (the table in ``RecipePipeline._get_stages``)."""
+    if chunk.input_type == InputType.PAPRIKA_CAYENNE:
+        if chunk.pre_parsed_embedding is not None:
+            return ["ASSEMBLE"]          # $0 — skip all Gemini calls
+        return ["EMBED", "ASSEMBLE"]     # Only embed: skip extract, refine and tag
+    # URL, PDF, EPUB, IMAGE, PAPRIKA_LEGACY — full pipeline
+    return ["EXTRACT", "REFINE", "EMBED", "ASSEMBLE", "TAG"]
+
+
+def chunk_needs_ai(chunk: Chunk) -> bool:
+    """True when the chunk's recipe is made by the model (REFINE runs): the decision behind ``ai_processed``.
+
+    Not ``pre_parsed is None``: a Cayenne chunk without ``pre_parsed`` still takes no
+    REFINE, and a non-Cayenne chunk with one still does.
+    """
+    return "REFINE" in chunk_stages(chunk)
+
+
+def chunk_calls_ai(chunk: Chunk) -> bool:
+    """True when any stage of the chunk calls Gemini: EXTRACT, REFINE, EMBED and TAG do, ASSEMBLE does not.
+
+    The kill switch covers all of these; only a chunk that ``chunk_needs_ai`` (REFINE) counts against the cap.
+    """
+    return any(stage != "ASSEMBLE" for stage in chunk_stages(chunk))
 
 
 class RecipePipeline:
@@ -127,7 +154,7 @@ class RecipePipeline:
         on_progress: Optional[Callable[[str, int, int], None]] = None,
         user_id: str = "",
         *,
-        on_result: Optional[Callable[[IngestResponse], None]] = None,
+        on_result: Optional[Callable[[IngestResponse, bool], Optional[bool]]] = None,
         on_skip: Optional[Callable[[Chunk, str, int], None]] = None,
         on_tags: Optional[Callable[[IngestResponse], None]] = None,
         on_tag_failed: Optional[Callable[[TagFailure], None]] = None,
@@ -144,7 +171,11 @@ class RecipePipeline:
             on_result:   Optional callback fired once per assembled recipe, in
                          completion order, from this thread.  Lets a caller
                          persist results as they arrive instead of after the
-                         whole batch.
+                         whole batch.  The second argument is True when REFINE
+                         ran for the recipe's chunk (AI processed it) and False
+                         for a Cayenne restore (AI caps D3).  Returning
+                         ``False`` (exactly) means the recipe was not written,
+                         so it is not queued for TAG; ``None``/``True`` keep it.
             on_skip:     Optional callback ``(chunk, reason, index) -> None``
                          fired for every chunk that produced no result because
                          of a failure.  ``index`` is the chunk's zero-based
@@ -253,7 +284,10 @@ class RecipePipeline:
             # position is the only identification a labelless (EPUB/PDF)
             # chunk has.
             future_to_chunk = {
-                executor.submit(_worker, chunk): (chunk, index)
+                # Each worker runs in a copy of the caller's context, so its Gemini calls are
+                # attributed to the job (usage.py, AI caps D8). One copy per submit: a Context
+                # cannot be entered by two threads at once.
+                executor.submit(contextvars.copy_context().run, _worker, chunk): (chunk, index)
                 for index, chunk in enumerate(chunks)
             }
 
@@ -283,7 +317,8 @@ class RecipePipeline:
                     for position, result in enumerate(outcome.results):
                         if on_result is not None:
                             try:
-                                on_result(result)
+                                if on_result(result, needs_tags) is False:
+                                    continue  # refused (the beta cap): not written, so nothing to tag
                             except Exception:
                                 # Deliberately NOT re-raised, unlike on_progress below. That
                                 # callback guards a stale stage label, which is indistinguishable
@@ -334,6 +369,7 @@ class RecipePipeline:
     def _get_stages(self, chunk: Chunk) -> List[str]:
         """
         Return the ordered list of stage names to execute for this chunk.
+        (The routing itself is ``chunk_stages``, which ``chunk_needs_ai`` shares.)
 
         Routing table (§4.2 / §7.3 of PIPELINE_REFACTOR.md):
           PAPRIKA_CAYENNE + embedding  → ['ASSEMBLE']
@@ -341,12 +377,7 @@ class RecipePipeline:
           All other InputTypes         → ['EXTRACT', 'REFINE', 'EMBED', 'ASSEMBLE', 'TAG']
           (TAG is not per chunk: it runs over every TAG_BATCH_SIZE finished recipes, in run())
         """
-        if chunk.input_type == InputType.PAPRIKA_CAYENNE:
-            if chunk.pre_parsed_embedding is not None:
-                return ["ASSEMBLE"]          # $0 — skip all Gemini calls
-            return ["EMBED", "ASSEMBLE"]     # Only embed: skip extract, refine and tag
-        # URL, PDF, EPUB, IMAGE, PAPRIKA_LEGACY — full pipeline
-        return ["EXTRACT", "REFINE", "EMBED", "ASSEMBLE", "TAG"]
+        return chunk_stages(chunk)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Per-chunk processing
