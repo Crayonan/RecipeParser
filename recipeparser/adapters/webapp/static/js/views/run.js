@@ -1,5 +1,5 @@
 // #/runs/:id — one run: controls, progress, milestones, chunks, log, errors, calls, recipes, analytics, config.
-import { h, clear, icon, fmt, statusBadge, severityBadge, levelColor, toast, openDrawer, popMenu, confirmDialog, barChart, hbars, diffView, debounce } from "../ui.js";
+import { h, clear, icon, fmt, statusBadge, severityBadge, levelColor, toast, openDrawer, closeDrawer, popMenu, confirmDialog, barChart, hbars, diffView, debounce } from "../ui.js";
 import { api } from "../api.js";
 import { live } from "../live.js";
 
@@ -13,6 +13,9 @@ export async function render(root, params, query) {
   const S = { detail: null, events: [], timeline: [], tab: query.get("tab") || "log", logFilter: { level: "INFO", kind: "", chunk: "", q: "" }, autoscroll: true, lastMilestone: null };
   const offs = [];
   const timers = [];
+  // Declared before the first loadDetail()/renderTabs() call below, which read and assign them.
+  let metaEl = null;
+  let logBox = null;
 
   const bar = h("div", { class: "control-bar" });
   const banner = h("div", { class: "mb-16" });
@@ -49,6 +52,7 @@ export async function render(root, params, query) {
   await loadTimeline();
   renderTabs();
 
+  const debouncedTab = debounce(() => renderTab(), 1500);
   offs.push(live.on("events", (events) => {
     const mine = events.filter((e) => e.run_id === id);
     if (!mine.length) return;
@@ -64,10 +68,8 @@ export async function render(root, params, query) {
   }));
   offs.push(live.on("runs", (runs) => { if (runs.some((r) => r.id === id)) refresh(); }));
   timers.push(setInterval(() => { if (S.detail?.run?.active) renderBarMeta(); }, 1000));
-  const debouncedTab = debounce(() => renderTab(), 1500);
 
   // ── control bar ─────────────────────────────────────────────────────────
-  let metaEl;
   function renderBarMeta() {
     if (!metaEl) return;
     const r = S.detail.run;
@@ -209,7 +211,6 @@ export async function render(root, params, query) {
   }
 
   // Live log
-  let logBox = null;
   function logLine(e) {
     return h("div", { class: `log-line ${e.level} ${e.kind === "milestone" ? "milestone" : ""}`, style: { cursor: e.data ? "pointer" : "" }, onclick: e.data ? () => openDrawer(`${e.kind} · ${fmt.time(e.ts)}`, [h("p", {}, e.message), h("pre", { class: "block" }, JSON.stringify(e.data, null, 2))]) : null },
       h("span", { class: "faint" }, fmt.time(e.ts)), h("span", { class: "lvl" }, e.level), h("span", { class: "faint" }, e.chunk != null ? `c${e.chunk}` : ""), h("span", { class: "kind", title: e.kind }, e.stage ? `${e.kind} · ${e.stage.toLowerCase()}` : e.kind), h("span", { class: "msg" }, e.message));
@@ -360,7 +361,8 @@ export async function render(root, params, query) {
       h("div", {}, h("h3", { class: "mb-16" }, `Directions (${steps.length})`), h("ol", { style: { margin: 0, paddingLeft: "20px" }, class: "col" }, steps.map((s) => h("li", {}, s)))),
       h("div", {}, h("h3", { class: "mb-16" }, "Embedding"), e ? h("dl", { class: "kv" }, ...[["Model", e.model], ["Dimensions", e.dims], ["L2 norm", e.norm], ["Mean", e.mean], ["Min / max", `${e.min} / ${e.max}`], ["Zero values", e.zeros], ["First 12 values", h("span", { class: "mono small" }, (e.head || []).join(", "))]].flatMap(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])) : h("p", { class: "muted" }, "No embedding recorded.")),
       h("div", {}, h("h3", { class: "mb-16" }, "API calls for this chunk"), callsTable(r.calls.map((c) => ({ ...c, ts: null })))),
-      h("details", {}, h("summary", { class: "small muted" }, "Raw recipe JSON"), h("pre", { class: "block mt-8" }, JSON.stringify(d, null, 2)))]);
+      h("details", {}, h("summary", { class: "small muted" }, "Raw recipe JSON"), h("pre", { class: "block mt-8" }, JSON.stringify(d, null, 2)))],
+      h("a", { class: "btn btn-sm btn-primary", href: `#/recipes/${recipeId}`, onclick: closeDrawer }, "Open in viewer"));
   }
 
   // Analytics

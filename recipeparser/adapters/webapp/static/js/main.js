@@ -12,6 +12,8 @@ import { api } from "./api.js";
 const ROUTES = [
   { re: /^\/$/, view: "dashboard", title: "Runs", nav: "runs" },
   { re: /^\/new$/, view: "newrun", title: "New run", nav: "new" },
+  { re: /^\/recipes$/, view: "recipes", title: "Recipes", nav: "recipes" },
+  { re: /^\/recipes\/([^/]+)$/, keys: ["id"], view: "recipe", title: "Recipe", nav: "recipes" },
   { re: /^\/runs\/([^/]+)$/, keys: ["id"], view: "run", title: "Run", nav: "runs" },
   { re: /^\/compare$/, view: "compare", title: "Compare runs", nav: "compare" },
   { re: /^\/errors$/, view: "errors", title: "Errors & alerts", nav: "errors" },
@@ -22,6 +24,7 @@ const ROUTES = [
 const NAV = [
   { id: "runs", href: "#/", label: "Runs", icon: "home" },
   { id: "new", href: "#/new", label: "New run", icon: "plus" },
+  { id: "recipes", href: "#/recipes", label: "Recipes", icon: "utensils" },
   { id: "compare", href: "#/compare", label: "Compare", icon: "compare" },
   { id: "errors", href: "#/errors", label: "Errors & alerts", icon: "alert" },
   { id: "prompts", href: "#/prompts", label: "Prompts", icon: "prompt" },

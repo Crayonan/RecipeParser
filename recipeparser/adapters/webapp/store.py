@@ -150,6 +150,52 @@ CREATE TABLE IF NOT EXISTS prompt_overrides (
     updated_at REAL NOT NULL
 );
 
+-- Recipe Lab (lab.py): edits, judgements and pictures beside a run's recipes; the extraction itself is never changed.
+CREATE TABLE IF NOT EXISTS recipe_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipe_id INTEGER NOT NULL,
+  run_id TEXT NOT NULL,
+  rev INTEGER,
+  ts REAL NOT NULL,
+  source TEXT NOT NULL,
+  target TEXT,
+  instruction TEXT,
+  summary TEXT,
+  status TEXT NOT NULL,
+  base_rev INTEGER NOT NULL DEFAULT 0,
+  suggestion_json TEXT,
+  data_json TEXT NOT NULL,
+  model TEXT,
+  tokens INTEGER
+);
+CREATE INDEX IF NOT EXISTS recipe_revisions_recipe ON recipe_revisions(recipe_id, id);
+
+CREATE TABLE IF NOT EXISTS recipe_judgements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipe_id INTEGER NOT NULL,
+  run_id TEXT NOT NULL,
+  ts REAL NOT NULL,
+  rev INTEGER NOT NULL,
+  model TEXT,
+  tokens INTEGER,
+  data_json TEXT NOT NULL,
+  state_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS recipe_judgements_recipe ON recipe_judgements(recipe_id, id);
+
+CREATE TABLE IF NOT EXISTS recipe_pictures (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipe_id INTEGER NOT NULL,
+  run_id TEXT NOT NULL,
+  ts REAL NOT NULL,
+  kind TEXT NOT NULL,
+  path TEXT NOT NULL,
+  prompt TEXT,
+  model TEXT,
+  cover INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS recipe_pictures_recipe ON recipe_pictures(recipe_id, id);
+
 CREATE TABLE IF NOT EXISTS prompt_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -256,7 +302,8 @@ class Store:
 
     def delete_run(self, run_id: str) -> None:
         with self.tx() as db:
-            for table in ("events", "api_calls", "errors", "recipes"):
+            lab = ("recipe_revisions", "recipe_judgements", "recipe_pictures")
+            for table in ("events", "api_calls", "errors", "recipes", *lab):
                 db.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM runs WHERE id = ?", (run_id,))
 

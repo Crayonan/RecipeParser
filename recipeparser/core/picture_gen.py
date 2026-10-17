@@ -53,12 +53,15 @@ def build_picture_prompt(title: str, description: Optional[str], ingredients: Se
     return "\n".join(lines)
 
 
-def generate_picture(client: Any, prompt: str) -> Tuple[bytes, str]:
-    """The first image Gemini returns for ``prompt``, and its MIME type. Raises NoPictureError when there is none."""
+def generate_picture(client: Any, prompt: str, model: Optional[str] = None) -> Tuple[bytes, str]:
+    """The first image Gemini returns for ``prompt``, and its MIME type. Raises NoPictureError when there is none.
+
+    ``model`` defaults to GEMINI_IMAGE_MODEL; the web app passes the one its settings resolve to.
+    """
     from google.genai import types  # noqa: PLC0415
 
     response = client.models.generate_content(
-        model=GEMINI_IMAGE_MODEL,
+        model=model or GEMINI_IMAGE_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE"],

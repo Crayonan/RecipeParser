@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from recipeparser import prompts as prompts_mod
 from recipeparser import providers
 from recipeparser.adapters.webapp import analytics
+from recipeparser.adapters.webapp import lab as lab_mod
 from recipeparser.adapters.webapp import settings as settings_mod
 from recipeparser.adapters.webapp.manager import MAX_CONCURRENCY, MAX_RPM, REPO_ROOT, RunError, RunManager
 from recipeparser.adapters.webapp.store import ACTIVE_STATUSES, Store
@@ -601,6 +602,10 @@ def create_app(data_dir: Path, env_file: Path, *, start_monitor: bool = True) ->
         return StreamingResponse(
             gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         )
+
+    # -- recipe lab: viewer, judge, refine, pictures ---------------------------
+
+    lab_mod.register(app, store, data_dir, _resolved)
 
     # ── frontend ─────────────────────────────────────────────────────────────
 
