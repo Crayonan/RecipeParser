@@ -51,6 +51,9 @@ _ALLOWED_LEGACY_MENTIONS = {
         "check_service_key_name() must name the legacy variable to detect and "
         "reject a half-configured deployment; it never reads its value."
     ),
+    "recipeparser/adapters/webapp/settings.py": (
+        "settings.registry() documents the legacy key so users are told what it was and why it refuses to start."
+    ),
 }
 
 _THIS_FILE = Path(__file__).resolve()

@@ -271,6 +271,57 @@ and synced to the app, never returned in a response).
 
 ---
 
+## Web App
+
+A browser app for running extractions and seeing everything that happens in them, with no terminal needed.
+
+### Start it
+
+```bash
+pip install -e .                 # once
+python -m recipeparser.adapters.webapp    # or: recipeparser-web
+# open http://127.0.0.1:8765
+```
+
+Options: `--port 8765`, `--host 127.0.0.1`, `--data-dir DIR` (default: the app data folder's `webapp/`, or
+`RP_WEBAPP_DATA_DIR`), and `--env-file FILE` (default: the app's `.env`, shared with the CLI and GUI, where API keys are saved).
+
+### What it does
+
+- **Runs**: start a run on an EPUB, PDF or `.paprikarecipes` file (upload it, give a path, or pick from the golden
+  corpus). Each run has its own provider and models, concurrency (1–256), requests per minute (1–500), recipe limit,
+  part of the book (start % and % to process), and per-run setting overrides.
+- **Control**: Pause, Resume, Stop and Kill are always available. Pause holds every chunk before its next model call.
+  Stop finishes the calls in flight and writes what was extracted. Kill ends the run's process group immediately.
+  Restart offers *same run*, *retry failed chunks* and *continue remaining*.
+- **Visibility**: every stage of every chunk, milestones, a live log (also printed to the console and kept in
+  `runs/<id>/run.log`), and every model call with its HTTP code, latency, tokens, prompt and reply. Every error,
+  alert and crash is recorded with its code (`HTTP 429`, `HTTP 404`, `TIMEOUT`, `PARSE`, `EXIT -9` …), what happened,
+  why, and how to fix it. You can mark errors resolved, with a note.
+- **Improvements**: REFINE adds review notes to each recipe (*needs review*, *note*, *diet*). They are shown with the
+  recipe and are not written into the archives.
+- **Analytics and comparison**: per-run metrics (throughput, latency percentiles, achieved requests/min, tokens,
+  estimated cost, errors by code, embedding statistics), and side-by-side comparison of runs. The comparison includes
+  differences in settings and prompts, and the recipes the runs have in common.
+- **Prompts**: edit any pipeline prompt (`{{placeholders}}`, validation, diff against the default, history). Edits
+  apply to runs started afterwards, and each run records the prompts it used.
+- **Settings**: every environment variable the package reads, with descriptions taken from `config.py`. Every
+  `config.py` constant can now be overridden with `RP_<NAME>`, alongside the existing `GEMINI_*` variables. Each run
+  records the values it used and where each value came from.
+- **Embeddings** must be 1536 values long. Embedding models that cannot produce that are refused before a run starts,
+  and every run probes the embedding model once before it processes anything.
+
+Runs are **local only**. They write a `.paprikarecipes` archive, a Cayenne zip and `recipes.json` under
+`<data dir>/runs/<id>/output/`, and never write to Supabase. The **offline replay** provider answers from the
+recordings in `tests/goldens`. Use it with the golden corpus books to try the app without an API key.
+
+Agents and scripts can check a run without the browser:
+- the run's SQLite database, `<data dir>/webapp.db` (tables `runs`, `events`, `api_calls`, `errors`, `recipes`);
+- the run's log, `<data dir>/runs/<id>/run.log`;
+- the JSON API (`/api/runs/<id>`, `/events`, `/errors`, `/calls`, `/analytics`).
+
+---
+
 ## Python Library API
 
 ```python

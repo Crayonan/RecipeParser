@@ -324,6 +324,19 @@
        the SOURCE HOST exactly as given. One short quote.
      - Leave both null when nothing above applies.
   
+  5. REVIEW NOTES:
+     - "review_notes": what the cook checking this recipe should know, as a list of
+       {"kind": ..., "text": ...} entries, each text one plain sentence naming the exact words concerned.
+     - "needs_review": something the cook should check or fix: a quantity given only in the
+       directions and not in the ingredient list; an ingredient line with no amount ("salt and
+       black pepper"); an ingredient the directions use that the list leaves out; an unclear or
+       unusual unit; a missing step, time or temperature the directions depend on.
+     - "note": an observation worth knowing that needs no fix, e.g. quantities printed in grams as
+       written, a measure you converted, a phase structure kept as printed.
+     - "diet": what the listed ingredients alone show about diet (vegan, vegetarian, gluten-free,
+       dairy-free, contains nuts), saying it is based on the listed ingredients. Never guess beyond them.
+     - Report only what the RAW RECIPE shows. An empty list is the right answer for a clean recipe.
+  
   SOURCE HOST: none
   
   RAW RECIPE:
@@ -424,6 +437,19 @@
        the SOURCE HOST exactly as given. One short quote.
      - Leave both null when nothing above applies.
   
+  5. REVIEW NOTES:
+     - "review_notes": what the cook checking this recipe should know, as a list of
+       {"kind": ..., "text": ...} entries, each text one plain sentence naming the exact words concerned.
+     - "needs_review": something the cook should check or fix: a quantity given only in the
+       directions and not in the ingredient list; an ingredient line with no amount ("salt and
+       black pepper"); an ingredient the directions use that the list leaves out; an unclear or
+       unusual unit; a missing step, time or temperature the directions depend on.
+     - "note": an observation worth knowing that needs no fix, e.g. quantities printed in grams as
+       written, a measure you converted, a phase structure kept as printed.
+     - "diet": what the listed ingredients alone show about diet (vegan, vegetarian, gluten-free,
+       dairy-free, contains nuts), saying it is based on the listed ingredients. Never guess beyond them.
+     - Report only what the RAW RECIPE shows. An empty list is the right answer for a clean recipe.
+  
   SOURCE HOST: taste.com.au
   
   RAW RECIPE:
@@ -482,6 +508,27 @@
 # name: TestSchemaSnapshots.test_cayenne_refinement_schema
   dict({
     '$defs': dict({
+      'ReviewNote': dict({
+        'description': 'One observation REFINE makes about a recipe for the person checking it.',
+        'properties': dict({
+          'kind': dict({
+            'description': '"needs_review" when the cook should check something (a quantity only in the method, an ingredient line with no amount, an unclear unit); "diet" for a dietary observation drawn only from the listed ingredients (vegan, gluten-free, contains nuts); "note" for anything else worth knowing (quantities printed in grams as written).',
+            'title': 'Kind',
+            'type': 'string',
+          }),
+          'text': dict({
+            'description': 'One plain sentence.',
+            'title': 'Text',
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'kind',
+          'text',
+        ]),
+        'title': 'ReviewNote',
+        'type': 'object',
+      }),
       'StructuredIngredient': dict({
         'properties': dict({
           'amount': dict({
@@ -629,6 +676,14 @@
           }),
         ]),
         'title': 'Base Servings',
+      }),
+      'review_notes': dict({
+        'description': 'Short notes for the cook reviewing this recipe: what is missing, ambiguous or worth checking, and what was observed. Empty when there is nothing to say.',
+        'items': dict({
+          '$ref': '#/$defs/ReviewNote',
+        }),
+        'title': 'Review Notes',
+        'type': 'array',
       }),
       'source_uom_system_detected': dict({
         'anyOf': list([

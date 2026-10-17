@@ -38,6 +38,7 @@ dependencies = [
 [project.scripts]
 recipeparser = "recipeparser.__main__:main"
 recipeparser-gui = "recipeparser.adapters.gui:run_gui"
+recipeparser-web = "recipeparser.adapters.webapp.__main__:main"
 
 [project.optional-dependencies]
 dev = [
@@ -60,7 +61,7 @@ where = ["."]
 include = ["recipeparser*"]
 
 [tool.setuptools.package-data]
-recipeparser = ["*.yaml"]
+recipeparser = ["*.yaml", "adapters/webapp/static/*.html", "adapters/webapp/static/css/*.css", "adapters/webapp/static/js/*.js", "adapters/webapp/static/js/views/*.js"]
 
 [tool.pytest.ini_options]
 # live_*_test.py files are standalone scripts that require a running server.
@@ -95,6 +96,7 @@ select = ["E", "F", "I", "TID"]
 [tool.ruff.lint.per-file-ignores]
 "recipeparser/io/**" = ["TID"]
 "recipeparser/adapters/**" = ["TID"]
+"tests/webapp/**" = ["TID"]
 # scripts/ are an outer shell, not core: a one-off repair exists precisely to
 # wire a reader to a writer, which is the composition adapters/ is allowed too.
 "scripts/**" = ["TID"]

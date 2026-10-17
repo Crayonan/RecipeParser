@@ -7,13 +7,54 @@ overrides, or future config-file loading only need to touch one place.
 import os
 from typing import Optional
 
+# Every constant below can be overridden from the environment. The names that
+# predate the web app keep their historic variable (GEMINI_MODEL, ...); every
+# other constant reads ``RP_<NAME>``. The web app (recipeparser/adapters/webapp) runs
+# each extraction in a child process with these variables set, which is how a
+# value chosen in the browser reaches the module-level imports below.
+ENV_PREFIX = "RP_"
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    return raw if raw not in (None, "") else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw.replace("_", "")))
+    except ValueError:
+        raise ValueError(f"Environment variable {name}={raw!r} is not a whole number.") from None
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw.replace("_", ""))
+    except ValueError:
+        raise ValueError(f"Environment variable {name}={raw!r} is not a number.") from None
+
+
+def _env_opt_int(name: str, default: Optional[int]) -> Optional[int]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    if raw.lower() in ("none", "null", "off", "0"):
+        return None
+    return _env_int(name, default or 0)
+
 # ---------------------------------------------------------------------------
 # EPUB / chunking
 # ---------------------------------------------------------------------------
 
 # Images smaller than this are treated as decorative separators/icons.
 # Real recipe photos are consistently >= 20 KB; separators are typically 2-14 KB.
-MIN_PHOTO_BYTES: int = 20_000
+MIN_PHOTO_BYTES: int = _env_int("RP_MIN_PHOTO_BYTES", 20_000)
 
 # A book image that decodes is kept as a photograph only when it looks like one
 # (book_images.photo_refusal, Fix Roadmap F-203). Byte size alone let through a
@@ -21,13 +62,13 @@ MIN_PHOTO_BYTES: int = 20_000
 # The shortest edge a photo of a dish has: a spacer, a bullet or a rule is
 # smaller. Cayenne draws a thumbnail at 44-160 px, so 100 is still a picture;
 # larger ornaments are left to the line-art test below.
-MIN_PHOTO_EDGE_PX: int = 100
+MIN_PHOTO_EDGE_PX: int = _env_int("RP_MIN_PHOTO_EDGE_PX", 100)
 # Wider than this (either way round) is a rule, a banner or a border strip.
-MAX_PHOTO_ASPECT: float = 4.0
+MAX_PHOTO_ASPECT: float = _env_float("RP_MAX_PHOTO_ASPECT", 4.0)
 # Luminance standard deviation (0-255, at 64 px) below which an image is a flat
 # field: a blank page, a solid block, a paper texture (0-1 measured). Photographs
 # measured 12-71, the lowest a dark, narrow-range one (the moon); 6 leaves margin.
-MIN_PHOTO_CONTRAST: float = 6.0
+MIN_PHOTO_CONTRAST: float = _env_float("RP_MIN_PHOTO_CONTRAST", 6.0)
 # Line art (an ink ornament, a silhouette, a block of text) is ink on paper: at
 # least LINE_ART_EXTREMES_SHARE of it in the darkest or lightest quarter of
 # luminance, AND at least LINE_ART_TOP_TWO_SHARE in its two commonest colours,
@@ -37,18 +78,18 @@ MIN_PHOTO_CONTRAST: float = 6.0
 # photos 0.01-0.57, the narrow-range ones (grass, gravel, a clock) at most 0.25;
 # a cup of coffee small on a white page 0.91 / 0.89 / 26, kept by its colours.
 # A coloured ornament (red on white, 0.77) is NOT caught: red is not ink-dark.
-LINE_ART_EXTREMES_SHARE: float = 0.9
-LINE_ART_TOP_TWO_SHARE: float = 0.8
-MIN_PHOTO_COLOURS: int = 12
+LINE_ART_EXTREMES_SHARE: float = _env_float("RP_LINE_ART_EXTREMES_SHARE", 0.9)
+LINE_ART_TOP_TWO_SHARE: float = _env_float("RP_LINE_ART_TOP_TWO_SHARE", 0.8)
+MIN_PHOTO_COLOURS: int = _env_int("RP_MIN_PHOTO_COLOURS", 12)
 
 # Maximum characters per text chunk sent to the LLM.
 # GEMINI_MODEL has a large context window, but very long chapters inflate
 # latency. ~30 k chars ≈ ~7-8 k tokens.
-MAX_CHUNK_CHARS: int = 30_000
+MAX_CHUNK_CHARS: int = _env_int("RP_MAX_CHUNK_CHARS", 30_000)
 
 # A non-recipe "image-only" chunk is injected as a HERO IMAGE breadcrumb into
 # the following chunk only when its non-image text is shorter than this.
-HERO_INJECT_MAX_STUB_CHARS: int = 120
+HERO_INJECT_MAX_STUB_CHARS: int = _env_int("RP_HERO_INJECT_MAX_STUB_CHARS", 120)
 
 # ---------------------------------------------------------------------------
 # Gemini API
@@ -71,26 +112,31 @@ HERO_INJECT_MAX_STUB_CHARS: int = 120
 # each cost a case that had been passing. ARCHITECTURE.md (section 8) has the
 # detail. Do NOT move this to gemini-3.5-flash-lite: it returned no usable
 # refinement in 42 of 42 runs.
-GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL: str = _env_str("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 # The embedding model behind /embed and the recipe-embedding pipeline stage.
 # Not implicated in gemini-2.5-flash's retirement — tracked separately.
-GEMINI_EMBEDDING_MODEL: str = os.environ.get(
-    "GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"
-)
+GEMINI_EMBEDDING_MODEL: str = _env_str("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
+
+# The size of every recipe embedding. Not an env override: the EMBED stage
+# refuses any other length, the Cayenne archive's _cayenne_meta restore path
+# reads vectors of this size, and Supabase's vector column is declared with it.
+# An embedding model is only usable if it can return exactly this many values
+# (recipeparser.providers.check_embedding_model).
+EMBEDDING_DIMENSIONS: int = 1536
 
 # The image model behind POST /recipes/{id}/image/generate (AI recipe picture,
 # design 2026-09-28, D8). gemini-2.5-flash-image shuts down 2026-10-02; this is
 # its stable successor. Override with GEMINI_IMAGE_MODEL to try another.
-GEMINI_IMAGE_MODEL: str = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
+GEMINI_IMAGE_MODEL: str = _env_str("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
 
 # The picture call's own bound, in seconds. A cook is waiting on it, so it is
 # far shorter than HTTP_TIMEOUT_SECS and is never retried.
-PICTURE_TIMEOUT_SECS: int = 60
+PICTURE_TIMEOUT_SECS: int = _env_int("RP_PICTURE_TIMEOUT_SECS", 60)
 
 # A cook is waiting at Generate: one bounded call, not a long think. Applied as
 # the HTTP timeout of the classify call (shopping design, Part 3 §2).
-CLASSIFY_TIMEOUT_SECS: int = 60
+CLASSIFY_TIMEOUT_SECS: int = _env_int("RP_CLASSIFY_TIMEOUT_SECS", 60)
 
 # Every call this package makes is a bounded extraction, refinement or
 # classification task with one correct JSON (or plain-text) answer, not
@@ -98,26 +144,26 @@ CLASSIFY_TIMEOUT_SECS: int = 60
 # output rate. Defaults to "minimal" for Gemini 3; override with
 # GEMINI_THINKING_LEVEL ('minimal', 'low', 'medium', 'high') to re-enable
 # thinking for a specific investigation.
-THINKING_LEVEL: str = os.environ.get("GEMINI_THINKING_LEVEL", "minimal")
+THINKING_LEVEL: str = _env_str("GEMINI_THINKING_LEVEL", "minimal")
 
 # Per-call HTTP timeout passed to generate_content (seconds).
-HTTP_TIMEOUT_SECS: int = 180
+HTTP_TIMEOUT_SECS: int = _env_int("RP_HTTP_TIMEOUT_SECS", 180)
 
 # Maximum retries on 429 / quota errors before giving up.
-MAX_RETRIES: int = 5
+MAX_RETRIES: int = _env_int("RP_MAX_RETRIES", 5)
 
 # A reply that will not parse is not a rate-limit signal: the transport
 # succeeded and the model simply returned truncated or malformed JSON. The
 # 2026-09-04 import showed such replies parse cleanly when asked again, so a
 # short, flat retry recovers them without adding the quota ladder's minutes to
 # every bad chunk of a large import.
-MAX_PARSE_RETRIES: int = 2
-PARSE_RETRY_DELAY_SECS: float = 1.0
+MAX_PARSE_RETRIES: int = _env_int("RP_MAX_PARSE_RETRIES", 2)
+PARSE_RETRY_DELAY_SECS: float = _env_float("RP_PARSE_RETRY_DELAY_SECS", 1.0)
 
 # Initial exponential back-off delay (seconds); doubles after each retry,
 # capped at BACKOFF_MAX_SECS.
-BACKOFF_BASE_SECS: float = 2.0
-BACKOFF_MAX_SECS: float = 120.0
+BACKOFF_BASE_SECS: float = _env_float("RP_BACKOFF_BASE_SECS", 2.0)
+BACKOFF_MAX_SECS: float = _env_float("RP_BACKOFF_MAX_SECS", 120.0)
 
 # ---------------------------------------------------------------------------
 # Pipeline concurrency
@@ -125,16 +171,16 @@ BACKOFF_MAX_SECS: float = 120.0
 
 # Maximum Gemini API calls in-flight at once (default when not overridden by CLI/GUI).
 # Gemini free tier = 5 requests per minute; use 1 and spacing (below) to stay under.
-MAX_CONCURRENT_API_CALLS: int = 1
+MAX_CONCURRENT_API_CALLS: int = _env_int("RP_MAX_CONCURRENT_API_CALLS", 1)
 
 # Hard cap on concurrency (--concurrency and GUI are clamped to this).
 # Google docs cite rate limits (RPM) rather than a concurrency number; 10 is a
 # conservative per-key ceiling to stay within typical RPM.
-MAX_CONCURRENT_CAP: int = 10
+MAX_CONCURRENT_CAP: int = _env_int("RP_MAX_CONCURRENT_CAP", 10)
 
 # When rpm is not set and concurrency is 1, wait this long between requests
 # to stay under free-tier 5 requests/minute.
-FREE_TIER_DELAY_SECS: float = 12.0
+FREE_TIER_DELAY_SECS: float = _env_float("RP_FREE_TIER_DELAY_SECS", 12.0)
 
 # No SEGMENT_TIMEOUT_SECS here any more. It named a per-chunk wall-clock bound
 # the pipeline never enforced: as_completed() only yields finished futures, so
@@ -147,31 +193,33 @@ FREE_TIER_DELAY_SECS: float = 12.0
 # ---------------------------------------------------------------------------
 
 # Fewer than this = treat as no TOC, fall back to raw chunks.
-MIN_TOC_ENTRIES: int = 2
+MIN_TOC_ENTRIES: int = _env_int("RP_MIN_TOC_ENTRIES", 2)
 
 # Fraction of TOC entries that must be classified as recipe names (not section headers).
 # Below this = fall back to raw chunking.
-MIN_TOC_RECIPE_RATIO: float = 0.5
+MIN_TOC_RECIPE_RATIO: float = _env_float("RP_MIN_TOC_RECIPE_RATIO", 0.5)
 
 # Fraction of TOC titles that must be found in text to use TOC-driven chunking.
 # Below this = fall back to raw chunks.
-MIN_TOC_MATCH_RATIO: float = 0.3
+MIN_TOC_MATCH_RATIO: float = _env_float("RP_MIN_TOC_MATCH_RATIO", 0.3)
 
 # Number of front-matter pages to scan for AI TOC parsing when PDF outline is empty.
 # Many cookbooks place the TOC on pages 5-8; scanning 10 pages covers typical layouts.
-TOC_PDF_FRONT_MATTER_PAGES: int = 10
+TOC_PDF_FRONT_MATTER_PAGES: int = _env_int("RP_TOC_PDF_FRONT_MATTER_PAGES", 10)
 
 # ---------------------------------------------------------------------------
 # PDF pre-flight (Phase 1)
 # ---------------------------------------------------------------------------
 
 # Below this average chars per page (over first N pages), PDF is treated as no text layer / scan.
-PDF_PREFLIGHT_MIN_CHARS_PER_PAGE: int = 100
-PDF_PREFLIGHT_SAMPLE_PAGES: int = 5
-PDF_PREFLIGHT_MIN_PAGES: int = 1  # Reject if 0 pages; warn if below this (e.g. pamphlet).
-PDF_PREFLIGHT_MAX_PAGES: Optional[int] = 2000  # Optional cap to avoid runaway cost; None = no cap.
+PDF_PREFLIGHT_MIN_CHARS_PER_PAGE: int = _env_int("RP_PDF_PREFLIGHT_MIN_CHARS_PER_PAGE", 100)
+PDF_PREFLIGHT_SAMPLE_PAGES: int = _env_int("RP_PDF_PREFLIGHT_SAMPLE_PAGES", 5)
+# Reject if 0 pages; warn if below this (e.g. pamphlet).
+PDF_PREFLIGHT_MIN_PAGES: int = _env_int("RP_PDF_PREFLIGHT_MIN_PAGES", 1)
+# Optional cap to avoid runaway cost; None (or "off") = no cap.
+PDF_PREFLIGHT_MAX_PAGES: Optional[int] = _env_opt_int("RP_PDF_PREFLIGHT_MAX_PAGES", 2000)
 # A scan is transcribed one vision call per page; a photo or a few pages is the use case, not a scanned book.
-PDF_OCR_MAX_PAGES: int = 40
+PDF_OCR_MAX_PAGES: int = _env_int("RP_PDF_OCR_MAX_PAGES", 40)
 
 # The largest upload POST /jobs/file takes, refused with a 413 and a sentence. The same number
 # sits in Cayenne's domain/ingestion.ts (MAX_UPLOAD_BYTES), where the intake refuses a file before
@@ -180,20 +228,20 @@ PDF_OCR_MAX_PAGES: int = 40
 # cap above already bounds what a scan can cost. A .paprikarecipes export is exempt: it is a
 # whole library with its photos (a 250 MB one is real), and its reader bounds each entry instead
 # (io/readers/paprika.py, _MAX_ENTRY_BYTES).
-MAX_UPLOAD_BYTES: int = 50_000_000
+MAX_UPLOAD_BYTES: int = _env_int("RP_MAX_UPLOAD_BYTES", 50_000_000)
 
 # ---------------------------------------------------------------------------
 # Phase 3 — Pipeline control and rate-limit auto-pause
 # ---------------------------------------------------------------------------
 
 # Number of consecutive HTTP 429 responses before the pipeline auto-pauses.
-RATE_LIMIT_PAUSE_THRESHOLD: int = 3
+RATE_LIMIT_PAUSE_THRESHOLD: int = _env_int("RP_RATE_LIMIT_PAUSE_THRESHOLD", 3)
 
 # Seconds to wait before auto-resuming after a rate-limit pause (default 12 h).
-RATE_LIMIT_AUTO_RESUME_SECS: int = 43_200
+RATE_LIMIT_AUTO_RESUME_SECS: int = _env_int("RP_RATE_LIMIT_AUTO_RESUME_SECS", 43_200)
 
 # Subdirectory name (relative to output_dir) where checkpoint JSON files are stored.
-CHECKPOINT_SUBDIR: str = ".recipeparser_checkpoints"
+CHECKPOINT_SUBDIR: str = _env_str("RP_CHECKPOINT_SUBDIR", ".recipeparser_checkpoints")
 
 # ---------------------------------------------------------------------------
 # Live-write guard

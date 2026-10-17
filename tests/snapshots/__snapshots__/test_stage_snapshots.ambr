@@ -123,6 +123,8 @@
         'Dessert',
       ]),
     }),
+    'review_notes': list([
+    ]),
     'source_uom_system_detected': None,
     'source_uom_system_evidence': None,
     'structured_ingredients': list([

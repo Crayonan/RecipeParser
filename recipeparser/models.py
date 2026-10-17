@@ -230,6 +230,36 @@ class CayenneRefinement(BaseModel):
         default=None,
         description="The words that judgement rests on, quoted exactly from the recipe, or the source host exactly as given.",
     )
+    # The refiner's own review of the recipe it just structured (web app "Improvements"). Kept on
+    # the refinement and carried to IngestResponse privately, so no archive or table changes shape.
+    review_notes: List["ReviewNote"] = Field(
+        default_factory=list,
+        description=(
+            "Short notes for the cook reviewing this recipe: what is missing, ambiguous or worth "
+            "checking, and what was observed. Empty when there is nothing to say."
+        ),
+    )
+
+
+REVIEW_KINDS = ("needs_review", "note", "diet")
+
+
+class ReviewNote(BaseModel):
+    """One observation REFINE makes about a recipe for the person checking it."""
+    # A plain string, not a Literal: an unexpected word must not cost the recipe. The web app
+    # files anything outside REVIEW_KINDS under "note".
+    kind: str = Field(
+        description=(
+            '"needs_review" when the cook should check something (a quantity only in the method, '
+            'an ingredient line with no amount, an unclear unit); "diet" for a dietary observation '
+            'drawn only from the listed ingredients (vegan, gluten-free, contains nuts); "note" for '
+            "anything else worth knowing (quantities printed in grams as written)."
+        )
+    )
+    text: str = Field(description="One plain sentence.")
+
+
+CayenneRefinement.model_rebuild()
 
 
 class CayenneRecipe(BaseModel):
@@ -316,6 +346,9 @@ class IngestResponse(CayenneRecipe):
     # Private so they never reach an API response, a model_dump or a
     # _cayenne_meta: the durable reference is image_url.
     _photo: Optional[Photo] = PrivateAttr(default=None)
+    # REFINE's review notes (CayenneRefinement.review_notes). Private for the same reason as
+    # _photo: they are for the person running the import, not for the stored recipe.
+    _review_notes: List[ReviewNote] = PrivateAttr(default_factory=list)
 
     @property
     def photo(self) -> Optional[Photo]:
@@ -324,6 +357,14 @@ class IngestResponse(CayenneRecipe):
 
     def attach_photo(self, photo: Optional[Photo]) -> None:
         self._photo = photo
+
+    @property
+    def review_notes(self) -> List[ReviewNote]:
+        """REFINE's notes on this recipe for whoever checks the import; empty when it had none."""
+        return self._review_notes
+
+    def attach_review_notes(self, notes: List[ReviewNote]) -> None:
+        self._review_notes = list(notes)
 
 
 class JobResponse(BaseModel):

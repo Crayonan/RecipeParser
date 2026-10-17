@@ -15,9 +15,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type, Typ
 from google.genai import errors as genai_errors
 from pydantic import BaseModel, Field, ValidationError
 
+from recipeparser import prompts
 from recipeparser.config import (
     BACKOFF_BASE_SECS,
     BACKOFF_MAX_SECS,
+    EMBEDDING_DIMENSIONS,
     GEMINI_EMBEDDING_MODEL,
     GEMINI_MODEL,
     HTTP_TIMEOUT_SECS,
@@ -375,7 +377,7 @@ def get_embeddings(
             # This is the EMBED stage of every run — an unbounded call here
             # hangs an ordinary import.
             config=genai_types.EmbedContentConfig(
-                output_dimensionality=1536,
+                output_dimensionality=EMBEDDING_DIMENSIONS,
                 http_options={"timeout": _HTTP_TIMEOUT_MS},
             ),
         )
@@ -403,8 +405,14 @@ def needs_table_normalisation(text: str) -> bool:
     )
 
 
-def build_table_prompt(text_chunk: str) -> str:
-    """The prompt that reformats a multi-column baker's percentage table."""
+@prompts.register(
+    "table",
+    title="Baker's table normalisation",
+    description="Rewrites a multi-column baker's percentage table into one ingredient per line before extraction.",
+    stage="EXTRACTING",
+    placeholders=("text_chunk",),
+)
+def _table_template(text_chunk: str) -> str:
     return f"""The following text is from a recipe book and contains one or more ingredient tables
 where each ingredient name, its weight, its volume measure, and its baker's percentage
 appear on separate lines rather than in columns.
@@ -418,6 +426,11 @@ Preserve all [IMAGE: ...] markers exactly as they appear.
 
 Text:
 {text_chunk}"""
+
+
+def build_table_prompt(text_chunk: str) -> str:
+    """The prompt that reformats a multi-column baker's percentage table."""
+    return prompts.render("table", text_chunk=text_chunk)
 
 
 def normalise_baker_table(text_chunk: str, client, *, limiter: Optional["GlobalRateLimiter"] = None) -> str:
@@ -452,8 +465,14 @@ def normalise_baker_table(text_chunk: str, client, *, limiter: Optional["GlobalR
         return text_chunk
 
 
-def build_plain_text_prompt(text: str) -> str:
-    """The prompt for a single recipe in plain text (Paprika import, pasted recipe)."""
+@prompts.register(
+    "plain_text",
+    title="Single-recipe extraction (plain text)",
+    description="EXTRACT for one recipe in plain text: a Paprika import, a pasted recipe, a scanned page.",
+    stage="EXTRACTING",
+    placeholders=("text",),
+)
+def _plain_text_template(text: str) -> str:
     return f"""
 You are a culinary data extractor. The following text is a recipe. Extract it.
 
@@ -479,6 +498,11 @@ Rules:
 Text:
 {text}
 """
+
+
+def build_plain_text_prompt(text: str) -> str:
+    """The prompt for a single recipe in plain text (Paprika import, pasted recipe)."""
+    return prompts.render("plain_text", text=text)
 
 
 def extract_recipe_from_text(
@@ -509,8 +533,14 @@ def extract_recipe_from_text(
     )
 
 
-def build_extract_prompt(text_chunk: str) -> str:
-    """The prompt for a book chunk that may hold several recipes."""
+@prompts.register(
+    "extract",
+    title="Book extraction",
+    description="EXTRACT for an EPUB or PDF chunk that may hold several recipes, with hero-photo matching.",
+    stage="EXTRACTING",
+    placeholders=("text_chunk",),
+)
+def _extract_template(text_chunk: str) -> str:
     return f"""
 You are a culinary data extractor. Review the following text from an EPUB recipe book.
 Extract ALL distinct recipes found in the text.
@@ -558,6 +588,11 @@ Text chunk:
 """
 
 
+def build_extract_prompt(text_chunk: str) -> str:
+    """The prompt for a book chunk that may hold several recipes."""
+    return prompts.render("extract", text_chunk=text_chunk)
+
+
 def extract_recipes(
     text_chunk: str,
     client,
@@ -589,6 +624,23 @@ def extract_recipes(
     )
 
 
+@prompts.register(
+    "vision",
+    title="Vision OCR (scanned pages)",
+    description="Transcribes a scanned PDF page image to text before extraction.",
+    stage="EXTRACTING",
+    placeholders=(),
+)
+def _vision_template() -> str:
+    return (
+        "You are an OCR assistant. The image is a page from a recipe document. "
+        "Transcribe ALL text exactly as it appears — including the recipe title, "
+        "ingredient quantities and names, and every numbered direction step. "
+        "Preserve line breaks between sections. "
+        "Do NOT add commentary, summaries, or any text not present in the image."
+    )
+
+
 def extract_text_via_vision(doc, client) -> str:
     """
     OCR fallback for scanned PDFs that contain no extractable text.
@@ -609,13 +661,7 @@ def extract_text_via_vision(doc, client) -> str:
     import fitz  # PyMuPDF — already a dependency; imported here to keep gemini.py PDF-agnostic
     from google.genai import types as genai_types
 
-    VISION_PROMPT = (
-        "You are an OCR assistant. The image is a page from a recipe document. "
-        "Transcribe ALL text exactly as it appears — including the recipe title, "
-        "ingredient quantities and names, and every numbered direction step. "
-        "Preserve line breaks between sections. "
-        "Do NOT add commentary, summaries, or any text not present in the image."
-    )
+    VISION_PROMPT = prompts.render("vision")
 
     page_texts: List[str] = []
     for page_num in range(doc.page_count):
@@ -712,17 +758,18 @@ _MENTION_USES = """   - Say how much of the ingredient each mention uses, as "us
    - Wrap only the ingredient's words, never "the", "your" or "of": "the flour" -> the words are "flour"."""
 
 
-def build_refine_prompt(
-    raw_recipe: object,
-    source_host: Optional[str],
-) -> str:
-    """The Pass-2 prompt: structured ingredients, fat tokens and the source system.
-
-    It asks for no tags: the TAG stage tags one axis per call (Cayenne Fix Roadmap F-246).
-
-    ``SOURCE HOST`` sits before ``RAW RECIPE:`` because the golden replay keys a refine call by the
-    text after that marker (tests/goldens/golden_client.py).
-    """
+@prompts.register(
+    "refine",
+    title="Refinement (structure, Fat Tokens, review notes)",
+    description=(
+        "REFINE: structured ingredients, Fat Token directions, the source measuring system, and the "
+        "review notes shown as Improvements."
+    ),
+    stage="REFINING",
+    placeholders=("source_host", "raw_recipe"),
+    required=("raw_recipe",),
+)
+def _refine_template(source_host: str, raw_recipe: str) -> str:
     return f"""
 You are a culinary data refiner. Transform this raw recipe into the structured Cayenne format.
 
@@ -797,11 +844,38 @@ RULES:
      the SOURCE HOST exactly as given. One short quote.
    - Leave both null when nothing above applies.
 
-SOURCE HOST: {source_host or "none"}
+5. REVIEW NOTES:
+   - "review_notes": what the cook checking this recipe should know, as a list of
+     {{"kind": ..., "text": ...}} entries, each text one plain sentence naming the exact words concerned.
+   - "needs_review": something the cook should check or fix: a quantity given only in the
+     directions and not in the ingredient list; an ingredient line with no amount ("salt and
+     black pepper"); an ingredient the directions use that the list leaves out; an unclear or
+     unusual unit; a missing step, time or temperature the directions depend on.
+   - "note": an observation worth knowing that needs no fix, e.g. quantities printed in grams as
+     written, a measure you converted, a phase structure kept as printed.
+   - "diet": what the listed ingredients alone show about diet (vegan, vegetarian, gluten-free,
+     dairy-free, contains nuts), saying it is based on the listed ingredients. Never guess beyond them.
+   - Report only what the RAW RECIPE shows. An empty list is the right answer for a clean recipe.
+
+SOURCE HOST: {source_host}
 
 RAW RECIPE:
 {raw_recipe}
 """
+
+
+def build_refine_prompt(
+    raw_recipe: object,
+    source_host: Optional[str],
+) -> str:
+    """The Pass-2 prompt: structured ingredients, fat tokens and the source system.
+
+    It asks for no tags: the TAG stage tags one axis per call (Cayenne Fix Roadmap F-246).
+
+    ``SOURCE HOST`` sits before ``RAW RECIPE:`` because the golden replay keys a refine call by the
+    text after that marker (tests/goldens/golden_client.py).
+    """
+    return prompts.render("refine", source_host=source_host or "none", raw_recipe=f"{raw_recipe}")
 
 
 def refine_json_schema() -> dict:
@@ -941,6 +1015,31 @@ class _BatchCategorization(BaseModel):
     results: List[_RecipeTags] = Field(default_factory=list)
 
 
+@prompts.register(
+    "categorize",
+    title="Tagging (categorize)",
+    description="TAG: places a batch of finished recipes under the tags of one taxonomy axis.",
+    stage="CATEGORIZING",
+    placeholders=("axes", "recipes"),
+)
+def _categorize_template(axes: str, recipes: str) -> str:
+    return f"""
+You are a culinary classifier. The user has just added these tags to their taxonomy:
+{axes}
+
+For EACH recipe below, list which of the tags above it belongs under. Rules:
+- Use ONLY tags from the list above, spelled exactly. Never invent a tag.
+- Return an empty list when none fits.
+- Return one result per recipe id, in any order.
+
+TAGGING RULES:
+{TAGGING_RULES}
+
+RECIPES:
+{recipes}
+"""
+
+
 def build_categorize_batch_prompt(
     recipes: List[Dict[str, Any]],
     new_axes: Dict[str, List[str]],
@@ -968,21 +1067,7 @@ def build_categorize_batch_prompt(
         "DIRECTIONS:\n" + "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(raw_body_column(r, "direction_steps")))
         for r in recipes
     )
-    return f"""
-You are a culinary classifier. The user has just added these tags to their taxonomy:
-{axes_text}
-
-For EACH recipe below, list which of the tags above it belongs under. Rules:
-- Use ONLY tags from the list above, spelled exactly. Never invent a tag.
-- Return an empty list when none fits.
-- Return one result per recipe id, in any order.
-
-TAGGING RULES:
-{TAGGING_RULES}
-
-RECIPES:
-{recipes_text}
-"""
+    return prompts.render("categorize", axes=axes_text, recipes=recipes_text)
 
 
 def categorize_batch(
