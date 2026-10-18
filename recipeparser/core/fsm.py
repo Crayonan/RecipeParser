@@ -247,9 +247,15 @@ class PipelineController:
 
     def request_pause(self) -> bool:
         """Signal the worker to pause at the next cooperative check point."""
+        # Cleared before the transition, so a worker that sees PAUSING finds the
+        # event already down and blocks rather than slipping one more call through.
+        with self._lock:
+            was_set = self._resume_event.is_set()
+            if self.status == PipelineStatus.RUNNING:
+                self._resume_event.clear()
         ok = self.transition("pause")
-        if ok:
-            self._resume_event.clear()
+        if not ok and was_set and self.status not in (PipelineStatus.PAUSING, PipelineStatus.PAUSED):
+            self._resume_event.set()
         return ok
 
     def request_resume(self) -> bool:
@@ -293,19 +299,51 @@ class PipelineController:
             return False
 
         if status == PipelineStatus.PAUSING:
-            # Confirm we are now fully paused
-            self.transition("paused")
-            log.info("PipelineController: pipeline paused — waiting for resume or cancel.")
+            # Confirm we are now fully paused. A chunk worker (wait_if_paused) may have
+            # confirmed it first, so both confirmations are idempotent rather than
+            # transitions that would log a spurious "invalid transition" warning.
+            with self._lock:
+                if self.status == PipelineStatus.PAUSING:
+                    self.status = PipelineStatus.PAUSED
+                    log.info("PipelineController: pipeline paused — waiting for resume or cancel.")
             # Block until resume_event is set
             self._resume_event.wait()
             # After unblocking, check whether we were cancelled or resumed
             with self._lock:
-                post_status = self.status
-            if post_status == PipelineStatus.CANCELLING:
-                return False
-            # Transition RESUMING → RUNNING (must be called outside _lock)
-            self.transition("running")
+                if self.status == PipelineStatus.CANCELLING:
+                    return False
+                if self.status == PipelineStatus.RESUMING:
+                    self.status = PipelineStatus.RUNNING
 
+        return True
+
+    def wait_if_paused(self) -> bool:
+        """
+        Called by every chunk worker before it starts another model call.
+
+        ``check_pause_point`` runs only in the loop that collects finished
+        chunks, so on its own a pause stopped nothing that had already been
+        submitted to the thread pool: every queued chunk still ran. This blocks
+        the calling worker while a pause is requested or in force (an in-flight
+        HTTP call finishes, no new one starts), confirms PAUSING -> PAUSED the
+        first time a worker arrives, and confirms RESUMING -> RUNNING the first
+        time one wakes. Returns False when the run is being cancelled.
+        """
+        with self._lock:
+            if self.status == PipelineStatus.CANCELLING:
+                return False
+            if self.status == PipelineStatus.PAUSING:
+                self.status = PipelineStatus.PAUSED
+                log.info("PipelineController: pipeline paused — workers waiting for resume or cancel.")
+            blocked = self.status == PipelineStatus.PAUSED
+        if blocked:
+            self._resume_event.wait()
+        with self._lock:
+            if self.status == PipelineStatus.CANCELLING:
+                return False
+            if self.status == PipelineStatus.RESUMING:
+                self.status = PipelineStatus.RUNNING
+                log.info("PipelineController: pipeline resumed.")
         return True
 
     # ── Rate-limit tracking (Phase 3c) ────────────────────────────────────────

@@ -23,16 +23,17 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
+from recipeparser.core import run_context
 from recipeparser.core.citation import Citation, host_of, resolve_citation
 from recipeparser.core.fsm import PipelineController
 from recipeparser.core.models import Chunk, InputType, SourceMeta
+from recipeparser.core.ports import CategorySource, ImageStore
 from recipeparser.core.rate_limiter import GlobalRateLimiter
 from recipeparser.core.stages.assemble import assemble
 from recipeparser.core.stages.embed import embed
 from recipeparser.core.stages.extract import extract
 from recipeparser.core.stages.refine import refine
 from recipeparser.core.stages.tag import TAG_BATCH_SIZE, TagFailure, tag_batch
-from recipeparser.core.ports import CategorySource, ImageStore
 from recipeparser.gemini import categorize_batch
 from recipeparser.models import CayenneRecipe, CayenneRefinement, IngestResponse, Photo
 from recipeparser.utils import title_case
@@ -48,6 +49,15 @@ class ChunkResult(NamedTuple):
 
     results: List[IngestResponse]
     skipped: List[str]
+
+
+class _Cancelled(BaseException):
+    """A cancel arrived while a worker waited at a stage boundary.
+
+    A BaseException so the per-chunk ``except Exception`` boundaries let it
+    through to ``_worker``, which ends the chunk quietly: a cancelled chunk is
+    neither a failure nor a skip.
+    """
 
 
 class _ChunkFailed(Exception):
@@ -202,12 +212,22 @@ class RecipePipeline:
             # A reader may have pulled a photograph out of the archive; store it
             # before ASSEMBLE so the assembled recipe carries a URL rather than
             # raw bytes.
-            if chunk.image_bytes and not chunk.image_url and self._image_store is not None:
-                chunk.image_url = self._image_store.put(
-                    chunk.image_bytes, str(uuid.uuid4()), chunk.image_content_type
-                )
-            stages = self._get_stages(chunk)
-            return self._process_chunk(chunk, stages)
+            index = chunk_index[id(chunk)]
+            run_context.set_chunk(index, chunk.label)
+            try:
+                # A paused run holds a queued chunk here, before it costs anything.
+                if not self._controller.wait_if_paused():
+                    return ChunkResult([], [])
+                if chunk.image_bytes and not chunk.image_url and self._image_store is not None:
+                    chunk.image_url = self._image_store.put(
+                        chunk.image_bytes, str(uuid.uuid4()), chunk.image_content_type
+                    )
+                stages = self._get_stages(chunk)
+                return self._process_chunk(chunk, stages)
+            except _Cancelled:
+                return ChunkResult([], [])
+            finally:
+                run_context.clear()
 
         # (chunk position, position in the chunk, recipe): chunks finish in any order, and a
         # batch is tagged in source order so the same import asks the same prompt (F-246).
@@ -223,8 +243,15 @@ class RecipePipeline:
             tag_queue.clear()
             if not batch or not user_axes:
                 return
+            saved_chunk, saved_label, saved_stage = run_context.current()
+            run_context.set_chunk(None)
+            run_context.set_stage("CATEGORIZING")
             self._controller.notify_stage_change("CATEGORIZING")
-            failures = tag_batch(batch, user_axes, parents, _categorize)
+            try:
+                failures = tag_batch(batch, user_axes, parents, _categorize)
+            finally:
+                run_context.set_chunk(saved_chunk, saved_label)
+                run_context.set_stage(saved_stage)
             for recipe in batch:
                 if on_tags is not None:
                     try:
@@ -247,6 +274,8 @@ class RecipePipeline:
             except Exception:
                 log.exception("RecipePipeline: on_skip callback failed — continuing.")
 
+        chunk_index = {id(chunk): index for index, chunk in enumerate(chunks)}
+
         with ThreadPoolExecutor(max_workers=self._cap) as executor:
             # Capture each chunk's submission position here — completion order
             # (via as_completed below) is not submission order, and that
@@ -259,6 +288,8 @@ class RecipePipeline:
 
             for future in as_completed(future_to_chunk):
                 chunk, index = future_to_chunk[future]
+                # The callbacks below run on this thread; let them say which chunk they report.
+                run_context.set_chunk(index, chunk.label)
 
                 # Cooperative pause/cancel check between chunk completions.
                 if not self._controller.check_pause_point():
@@ -315,8 +346,10 @@ class RecipePipeline:
                             log.exception("RecipePipeline: on_progress callback failed — re-raising (§11.4).")
                             raise
 
+        run_context.clear()
         # What is left in the queue, after the last chunk or a cancel (design D1).
         _flush_tags()
+        run_context.clear()
 
         # Transition FSM back to IDLE on normal completion.
         self._controller.transition("done")
@@ -330,6 +363,17 @@ class RecipePipeline:
     # ──────────────────────────────────────────────────────────────────────────
     # Stage routing
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _enter_stage(self, stage: str) -> None:
+        """Wait out a pause, then announce *stage* for the current chunk.
+
+        Every model call a chunk makes sits behind one of these, so a pause
+        holds the worker before its next call and a cancel ends it here.
+        """
+        if not self._controller.wait_if_paused():
+            raise _Cancelled()
+        run_context.set_stage(stage)
+        self._controller.notify_stage_change(stage)
 
     def _get_stages(self, chunk: Chunk) -> List[str]:
         """
@@ -380,7 +424,7 @@ class RecipePipeline:
             # Use explicit None check — an empty list is a valid (if degenerate) embedding
             # and must not fall through to pr.embedding (which CayenneRecipe lacks).
             embedding = chunk.pre_parsed_embedding if chunk.pre_parsed_embedding is not None else []
-            self._controller.notify_stage_change("EMBEDDING")
+            self._enter_stage("EMBEDDING")
             result = assemble(
                 recipe=_pre_parsed_to_refinement(pr),
                 embedding=embedding,
@@ -404,7 +448,7 @@ class RecipePipeline:
                 log.warning("_process_chunk: EMBED+ASSEMBLE stage but pre_parsed is None — skipping chunk.")
                 return ChunkResult([], [])
             pr = chunk.pre_parsed
-            self._controller.notify_stage_change("EMBEDDING")
+            self._enter_stage("EMBEDDING")
             self._limiter.wait_then_record_start()
             embedding = embed(
                 recipe=_pre_parsed_to_refinement(pr),
@@ -431,7 +475,7 @@ class RecipePipeline:
         plain_text = chunk.input_type == InputType.PAPRIKA_LEGACY
 
         # EXTRACT
-        self._controller.notify_stage_change("EXTRACTING")
+        self._enter_stage("EXTRACTING")
         # extract() takes its own slot before each Gemini call it makes (up to three: the baker's
         # table, the extraction, the number-guard retry), so none is taken for it here (F-012).
         extraction = extract(
@@ -449,7 +493,7 @@ class RecipePipeline:
         try:
             for raw in extraction.recipes:
                 # REFINE
-                self._controller.notify_stage_change("REFINING")
+                self._enter_stage("REFINING")
                 self._limiter.wait_then_record_start()
                 refined = refine(
                     raw=raw,
@@ -461,7 +505,7 @@ class RecipePipeline:
                 # Tags come later, from the TAG stage over every TAG_BATCH_SIZE finished recipes (F-246).
 
                 # EMBED
-                self._controller.notify_stage_change("EMBEDDING")
+                self._enter_stage("EMBEDDING")
                 self._limiter.wait_then_record_start()
                 embedding = embed(recipe=refined, client=self._client)
 
@@ -500,6 +544,7 @@ class RecipePipeline:
                     notes=getattr(raw, "notes", None),
                 )
                 result.attach_photo(photo)
+                result.attach_review_notes(refined.review_notes)
                 results.append(result)
         except Exception as exc:
             if not skipped:

@@ -10,12 +10,13 @@ No imports from recipeparser.io or recipeparser.adapters are permitted here.
 import logging
 from typing import Any, List
 
+from recipeparser.config import EMBEDDING_DIMENSIONS
 from recipeparser.gemini import get_embeddings
 from recipeparser.models import CayenneRefinement
 
 log = logging.getLogger(__name__)
 
-_EXPECTED_DIMS = 1536
+_EXPECTED_DIMS = EMBEDDING_DIMENSIONS
 
 
 def embed(
