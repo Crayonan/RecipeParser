@@ -47,8 +47,8 @@ def test_refine_keeps_review_notes(monkeypatch):
         title="Apple Tart",
         base_servings=4,
         structured_ingredients=[
-            StructuredIngredient(id="i1", amount=1.0, unit="cup", name="flour", fallback_string="1 cup flour"),
-            StructuredIngredient(id="i2", amount=2.0, unit="", name="apples", fallback_string="2 apples"),
+            StructuredIngredient(id="i1", kind="ingredient", amount=1.0, unit="cup", name="flour", fallback_string="1 cup flour"),
+            StructuredIngredient(id="i2", kind="ingredient", amount=2.0, unit="", name="apples", fallback_string="2 apples"),
         ],
         tokenized_directions=[
             TokenizedDirection(step=1, text="Roll dough"),
@@ -84,8 +84,8 @@ def test_pipeline_populates_ingest_response_review_notes(monkeypatch):
         title="Sponge Cake",
         base_servings=6,
         structured_ingredients=[
-            StructuredIngredient(id="i1", amount=3.0, unit="", name="eggs", fallback_string="3 eggs"),
-            StructuredIngredient(id="i2", amount=100.0, unit="g", name="sugar", fallback_string="100g sugar"),
+            StructuredIngredient(id="i1", kind="ingredient", amount=3.0, unit="", name="eggs", fallback_string="3 eggs"),
+            StructuredIngredient(id="i2", kind="ingredient", amount=100.0, unit="g", name="sugar", fallback_string="100g sugar"),
         ],
         tokenized_directions=[
             TokenizedDirection(step=1, text="Whisk eggs"),
@@ -127,7 +127,7 @@ def test_review_notes_not_present_in_model_dump_or_exports(tmp_path):
         title="Pudding",
         base_servings=4,
         structured_ingredients=[
-            StructuredIngredient(id="i1", amount=1, unit="cup", name="milk", fallback_string="1 cup milk")
+            StructuredIngredient(id="i1", kind="ingredient", amount=1, unit="cup", name="milk", fallback_string="1 cup milk")
         ],
         tokenized_directions=[TokenizedDirection(step=1, text="Boil milk")],
         embedding=[0.2] * 1536,
@@ -180,7 +180,7 @@ def test_runner_on_result_stores_review_notes_and_sets_flag(tmp_path):
         title="Recipe with Note",
         base_servings=2,
         structured_ingredients=[
-            StructuredIngredient(id="i1", amount=1, unit="tsp", name="salt", fallback_string="1 tsp salt")
+            StructuredIngredient(id="i1", kind="ingredient", amount=1, unit="tsp", name="salt", fallback_string="1 tsp salt")
         ],
         tokenized_directions=[TokenizedDirection(step=1, text="Add salt")],
         embedding=[0.1] * 1536,
@@ -202,7 +202,7 @@ def test_runner_on_result_stores_review_notes_and_sets_flag(tmp_path):
         title="Recipe without Note",
         base_servings=2,
         structured_ingredients=[
-            StructuredIngredient(id="i1", amount=1, unit="tsp", name="sugar", fallback_string="1 tsp sugar")
+            StructuredIngredient(id="i1", kind="ingredient", amount=1, unit="tsp", name="sugar", fallback_string="1 tsp sugar")
         ],
         tokenized_directions=[TokenizedDirection(step=1, text="Add sugar")],
         embedding=[0.1] * 1536,

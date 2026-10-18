@@ -615,14 +615,15 @@ class Runner:
                       "elapsed": elapsed, "eta": eta},
             )
 
-    def _on_result(self, recipe: Any) -> None:
+    def _on_result(self, recipe: Any, ai_processed: bool = True) -> Optional[bool]:
+        """Store one recipe; False when the recipe limit refuses it (the pipeline then skips tagging it)."""
         from recipeparser import config
         from recipeparser.core import run_context
         from recipeparser.models import REVIEW_KINDS
 
         chunk, _label, _ = run_context.current()
         if self.max_recipes and self.recipe_count >= self.max_recipes:
-            return
+            return False
         self.recipe_count += 1
         self.chunk_recipes[chunk if chunk is not None else -1] = (
             self.chunk_recipes.get(chunk if chunk is not None else -1, 0) + 1

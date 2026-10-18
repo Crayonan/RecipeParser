@@ -29,6 +29,7 @@ import base64
 import gzip
 import json
 import logging
+import math
 import zipfile
 import zlib
 from pathlib import Path
@@ -95,6 +96,27 @@ def _decode_photo(entry: Dict[str, Any]) -> tuple[Optional[bytes], str]:
         return None, content_type
 
 
+def _valid_embedding(value: Any) -> bool:
+    """True for a list of exactly 1536 finite numbers (bools excluded)."""
+    return (
+        isinstance(value, list)
+        and len(value) == 1536
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in value)
+    )
+
+
+def _unreadable_cayenne_chunk(entry: Dict[str, Any]) -> Chunk:
+    """The skipped line for an entry whose ``_cayenne_meta`` could not be read (D6)."""
+    name = str(entry.get("name") or "").strip()
+    return Chunk(
+        text="",
+        input_type=InputType.PAPRIKA_CAYENNE,
+        pre_parsed=None,
+        skip_reason=f"{name or 'Untitled recipe'}: the Cayenne data in this entry could not be read",
+        label=name or None,
+    )
+
+
 class PaprikaReader(RecipeReader):
     """
     Reads a .paprikarecipes ZIP archive and returns the decoded recipe entries.
@@ -115,8 +137,10 @@ class PaprikaReader(RecipeReader):
           - ``pre_parsed`` is populated from the meta dict
           - ``pre_parsed_embedding`` is extracted if present (enables $0 restore)
           - ``text`` is empty (not needed for the fast-path ASSEMBLE stage)
-        - Entries WITH corrupt ``_cayenne_meta`` (validation error) → same as
-          legacy: ``InputType.PAPRIKA_LEGACY`` using Paprika name/ingredients/directions
+        - Entries WITH corrupt ``_cayenne_meta`` (validation error) → a skipped
+          line: a ``PAPRIKA_CAYENNE`` chunk with ``skip_reason`` set and no
+          ``pre_parsed``. It never reaches the AI pipeline (D6).
+        - The embedding is kept only as a list of exactly 1536 finite floats.
         - Entries WITHOUT ``_cayenne_meta`` → ``InputType.PAPRIKA_LEGACY``
           - ``text`` is built from name + ingredients + directions
           - Full pipeline (EXTRACT → REFINE → CATEGORIZE → EMBED → ASSEMBLE)
@@ -146,20 +170,24 @@ class PaprikaReader(RecipeReader):
                 # this works whether or not the archive was exported with one.
                 # IngestResponse *requires* embedding, so we use CayenneRecipe
                 # here and carry the vector in pre_parsed_embedding instead.
-                meta_copy = dict(meta)
-                embedding = meta_copy.pop("embedding", None)
-
                 try:
+                    if not isinstance(meta, dict):
+                        raise TypeError(f"_cayenne_meta is a {type(meta).__name__}, not an object")
+                    meta_copy = dict(meta)
+                    embedding = meta_copy.pop("embedding", None)
                     pre_parsed = CayenneRecipe(**meta_copy)
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "PaprikaReader: could not deserialize _cayenne_meta for %r: %s — "
-                        "falling back to PAPRIKA_LEGACY (Flow A).",
+                        "skipping the entry.",
                         entry.get("name"),
                         exc,
                     )
-                    pre_parsed = None
-                    embedding = None  # orphan embedding must not attach to a legacy chunk
+                    chunks.append(_unreadable_cayenne_chunk(entry))
+                    continue
+
+                if not _valid_embedding(embedding):
+                    embedding = None
 
             if pre_parsed is not None:
                 photo_bytes, photo_type = _decode_photo(entry)
@@ -175,16 +203,16 @@ class PaprikaReader(RecipeReader):
                     )
                 )
             else:
-                # Flow A — Legacy Paprika → full pipeline (no _cayenne_meta, or
-                # corrupt meta that failed CayenneRecipe validation above).
+                # Flow A — Legacy Paprika → full pipeline (no _cayenne_meta;
+                # an unreadable one was skipped above).
                 name = entry.get("name", "")
                 ingredients = entry.get("ingredients", "")
                 directions = entry.get("directions", "")
 
                 # Servings is free text in Paprika ("Serves 4", "8 to 12", "1 or 2
-                # loaves"), so it goes to the extractor as a line of the recipe and
-                # refine turns it into a numeric base_servings, exactly as it already
-                # does for a book. No servings parser lives in this repository.
+                # loaves"), so it goes to the extractor as a line of the recipe, as it
+                # does for a book. core/servings.py classifies the extracted yield into
+                # base_servings and servings_source; the model's estimate is the last resort.
                 servings = str(entry.get("servings") or "").strip()
                 servings_line = f"Servings: {servings}\n\n" if servings else ""
                 text = (
@@ -301,9 +329,8 @@ class PaprikaReader(RecipeReader):
                             name,
                             exc,
                         )
-                        # Remove the malformed key so the entry falls through
-                        # to Flow A (full pipeline) rather than failing silently.
-                        del entry["_cayenne_meta"]
+                        # Keep the unreadable value: read() turns the entry into
+                        # a skipped line (D6), never a legacy AI-pipeline chunk.
 
                 log.debug(
                     "Parsed entry %r: name=%r cayenne=%s",

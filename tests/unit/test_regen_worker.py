@@ -4,7 +4,7 @@ import logging
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
-from recipeparser.models import CayenneRefinement, StructuredIngredient, TokenizedDirection
+from recipeparser.models import CayenneRefinement, RecipePan, StructuredIngredient, TokenizedDirection
 
 
 class _Result:
@@ -59,15 +59,16 @@ def _row(rev=3, rid="r1"):
 def _refinement():
     return CayenneRefinement(
         title="Cake", base_servings=4,
-        structured_ingredients=[StructuredIngredient(id="ing_01", name="flour",
+        structured_ingredients=[StructuredIngredient(id="ing_01", kind="ingredient", name="flour",
                                                      fallback_string="1 cup flour", line_index=0)],
         tokenized_directions=[TokenizedDirection(step=1, text="Mix {{ing_01|flour}}.")],
     )
 
 
-def _worker(fake, refine_fn=None, embed_fn=None, clock=None):
+def _worker(fake, refine_fn=None, embed_fn=None, clock=None, **kwargs):
     from recipeparser.adapters.regen_worker import RegenWorker
     extra = {"clock": clock} if clock else {}
+    extra.update(kwargs)
     return RegenWorker(
         fake, gemini_client=MagicMock(),
         refine_fn=refine_fn or MagicMock(return_value=_refinement()),
@@ -77,7 +78,12 @@ def _worker(fake, refine_fn=None, embed_fn=None, clock=None):
 
 
 def _ops(fake, table):
-    return [q.ops for q in fake.queries if q.table == table]
+    """The write ops on a table; the edit-guard's select is read separately by _selects."""
+    return [q.ops for q in fake.queries if q.table == table and not (q.ops and q.ops[0][0] == "select")]
+
+
+def _selects(fake, table):
+    return [q.ops for q in fake.queries if q.table == table and q.ops and q.ops[0][0] == "select"]
 
 
 def test_claims_with_batch_size():
@@ -416,3 +422,104 @@ def test_run_workers_still_sleeps_between_rounds_of_a_regen_backlog():
     asyncio.run(asyncio.wait_for(run_workers([RegenLike()], stop, poll_seconds=0.2), timeout=5))
     gaps = [b - a for a, b in zip(stamps, stamps[1:])]
     assert len(gaps) == 2 and all(g >= 0.15 for g in gaps), gaps
+
+
+class _TwoTable(FakeSupabase):
+    """The select answers one thing (a dict, as .single() does), the write-back another."""
+    def __init__(self, current, **kw):
+        super().__init__(**kw)
+        self.current = current
+    def table(self, name):
+        q = _Query(self, name)
+        fake = self
+        orig = q.execute
+        def execute():
+            if q.ops and q.ops[0][0] == "select":
+                fake.queries.append(q)
+                exc = fake.raises.get("select")
+                if exc is not None:
+                    raise exc
+                return _Result(fake.current)
+            return orig()
+        q.execute = execute  # type: ignore[method-assign]
+        return q
+
+
+def _tin_refinement():
+    r = _refinement()
+    r.tokenized_directions = [TokenizedDirection(step=1, text="Bake in {{pan_01|two tins}} and {{pan_02|a tray}}.")]
+    r.pans = [RecipePan(id="pan_01", raw="two tins", count=2), RecipePan(id="pan_02", raw="a tray")]
+    return r
+
+
+def test_regen_reads_the_rows_current_tins_and_keeps_an_edited_one():
+    cooks = [{"id": "pan_01", "raw": "two tins", "count": 2, "edited": True}]
+    fake = _TwoTable(
+        {"pans": cooks}, rpc_responses={"claim_stale_recipes": [_row()]}, responses={"recipes": [{"id": "r1"}]}
+    )
+    _worker(fake, refine_fn=MagicMock(return_value=_tin_refinement())).run_once()
+    assert _selects(fake, "recipes") == [[("select", ("pans",), {}), ("eq", ("id", "r1"), {}), ("single", (), {})]]
+    payload = _ops(fake, "recipes")[0][0][1][0]
+    assert payload["pans"] == cooks
+    assert payload["tokenized_directions"][0]["text"] == "Bake in {{pan_01|two tins}} and a tray."
+
+
+def test_a_failed_tin_read_writes_refines_tins_and_logs(caplog):
+    fake = _TwoTable(
+        {},
+        rpc_responses={"claim_stale_recipes": [_row()]},
+        responses={"recipes": [{"id": "r1"}]},
+        raises={"select": RuntimeError("boom")},
+    )
+    with caplog.at_level(logging.WARNING, logger="recipeparser.adapters.regen_worker"):
+        _worker(fake, refine_fn=MagicMock(return_value=_tin_refinement())).run_once()
+    payload = _ops(fake, "recipes")[0][0][1][0]
+    assert [p["id"] for p in payload["pans"]] == ["pan_01", "pan_02"]
+    assert "{{pan_02|a tray}}" in payload["tokenized_directions"][0]["text"]
+    assert not any(n == "regen_failed" for n, _ in fake.rpcs)
+    assert any("could not read current tins" in r.getMessage() for r in caplog.records)
+
+
+def test_a_non_list_pans_column_is_ignored():
+    fake = _TwoTable(
+        {"pans": "garbage"}, rpc_responses={"claim_stale_recipes": [_row()]}, responses={"recipes": [{"id": "r1"}]}
+    )
+    _worker(fake, refine_fn=MagicMock(return_value=_tin_refinement())).run_once()
+    assert [p["id"] for p in _ops(fake, "recipes")[0][0][1][0]["pans"]] == ["pan_01", "pan_02"]
+
+
+def test_paused_non_exempt_row_is_left_to_its_lease_not_refined():
+    # AI caps D5: the claim is left to lapse, so the queue moves on to other owners.
+    refine = MagicMock()
+    fake = FakeSupabase(rpc_responses={"claim_stale_recipes": [_row(rev=3)]})
+    w = _worker(fake, refine_fn=refine, ai_allowed=lambda u: False)
+    assert w.run_once() == 1
+    refine.assert_not_called()
+    assert _ops(fake, "recipes") == []
+    assert not any(n == "regen_failed" for n, _ in fake.rpcs)
+
+
+def test_paused_batch_refines_only_the_exempt_owners_row():
+    refine = MagicMock(return_value=_refinement())
+    rows = [dict(_row(rid="a"), user_id="plain"), dict(_row(rid="b"), user_id="exempt")]
+    fake = FakeSupabase(rpc_responses={"claim_stale_recipes": rows})
+    _worker(fake, refine_fn=refine, ai_allowed=lambda u: u == "exempt").run_once()
+    assert refine.call_count == 1
+    touched = {o[1] for ops in _ops(fake, "recipes") for o in ops if o[0] == "eq" and o[1][0] == "id"}
+    assert touched == {("id", "b")}
+
+
+def test_regen_calls_are_attributed_to_the_rows_owner():
+    from recipeparser import usage
+    seen = []
+
+    def refine(*a, **k):
+        ctx = usage.ai_context.get()
+        seen.append((ctx.user_id, ctx.action))
+        raise RuntimeError("stop here")
+
+    row = dict(_row(), user_id="u9")
+    fake = FakeSupabase(rpc_responses={"claim_stale_recipes": [row]})
+    _worker(fake, refine_fn=refine).run_once()
+    assert seen == [("u9", "regen")]
+    assert usage.ai_context.get() is None

@@ -109,3 +109,122 @@ def test_both_extract_prompts_name_the_three_fields():
 
     for prompt in (gemini.build_plain_text_prompt("x"), gemini.build_extract_prompt("x")):
         assert "total_time:" in prompt and "description:" in prompt and "nutritional_info:" in prompt
+
+
+from recipeparser.models import CayenneRecipe, CayenneRefinement, PanAnswer, RecipePan  # noqa: E402
+
+
+def test_refinement_defaults_to_no_tins_and_no_bake():
+    r = CayenneRefinement(title="T", base_servings=4, structured_ingredients=[], tokenized_directions=[])
+    assert r.pans == [] and r.bake_type is None and r.bake_step is None
+
+
+def test_recipe_pan_round_trips_with_mm_and_hint():
+    p = RecipePan.model_validate({"id": "pan_01", "raw": "two 20cm tins", "count": 2, "shape": "round",
+                                  "family": "round-cake", "dims_mm": {"d": 200}, "capacity_ml": None,
+                                  "catalog_hint": None})
+    assert p.dims_mm.d == 200 and p.edited is False and p.model_dump()["dims_mm"]["depth"] is None
+
+
+def test_pan_answer_tolerates_free_text_vocab():
+    a = PanAnswer.model_validate({"pans": [{"id": "pan_01", "raw": "a tin", "count": 1, "shape": "blob",
+                                            "family": "cake", "dims_mm": {}}], "bake_type": "souffle",
+                                  "bake_step": 9, "mentions": [], "core": []})
+    assert a.pans[0].shape == "blob"  # vocab is enforced by core/pans.py, never by validation
+
+
+def _property_names(obj):
+    """Every property name anywhere in a JSON schema."""
+    found = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "properties" and isinstance(v, dict):
+                found.update(v)
+            found |= _property_names(v)
+    elif isinstance(obj, list):
+        for i in obj:
+            found |= _property_names(i)
+    return found
+
+
+def test_refine_and_pan_schemas_have_no_client_fields():
+    from recipeparser.gemini import refine_json_schema, schema_without_client_fields
+    for schema in (refine_json_schema(), schema_without_client_fields(PanAnswer.model_json_schema())):
+        names = _property_names(schema)
+        assert "edited" not in names and "removed" not in names
+    assert "pans" in refine_json_schema()["properties"]
+    # The helper is what strips them: the raw model schema still carries both.
+    raw = _property_names(PanAnswer.model_json_schema())
+    assert "edited" in raw and "removed" in raw
+
+
+def test_the_pan_call_schema_has_no_client_fields():
+    from unittest.mock import MagicMock, patch
+
+    from recipeparser import gemini
+    response = MagicMock()
+    response.text = '{"pans": [], "bake_type": null, "bake_step": null, "mentions": [], "core": []}'
+    with patch.object(gemini, "_call_with_retry", return_value=response) as call:
+        gemini.tag_pans(["Bake."], ["flour"], None, MagicMock())
+    names = _property_names(call.call_args.kwargs["config"]["response_json_schema"])
+    assert "pans" in names and "edited" not in names and "removed" not in names
+
+
+_V2 = {
+    "title": "T", "structured_ingredients": [], "tokenized_directions": [],
+    "is_favourite": True, "category_paths": [["Course", "Dessert"], ["Cuisine"]],
+    "source_uom_system": "UK", "image_source": "generated", "stale": True,
+}
+
+
+def test_cayenne_recipe_accepts_v2_fields():
+    from recipeparser.models import CayenneRecipe
+    r = CayenneRecipe.model_validate(_V2)
+    assert r.is_favourite is True
+    assert r.category_paths == [["Course", "Dessert"], ["Cuisine"]]
+    assert r.source_uom_system == "UK" and r.image_source == "generated" and r.stale is True
+
+
+def test_cayenne_recipe_v1_meta_still_validates():
+    from recipeparser.models import CayenneRecipe
+    r = CayenneRecipe.model_validate({"title": "T", "structured_ingredients": [], "tokenized_directions": []})
+    assert r.category_paths == [] and r.stale is False and r.is_favourite is None
+    assert r.source_uom_system is None and r.image_source is None
+
+
+def test_recipe_pan_keeps_removed():
+    p = RecipePan.model_validate({"id": "pan_01", "raw": "a tin", "removed": True})
+    assert p.removed is True
+    assert RecipePan.model_validate({"id": "pan_01", "raw": "a tin"}).removed is False
+
+
+def test_cayenne_recipe_reads_null_paths_and_stale_as_defaults():
+    r = CayenneRecipe.model_validate(
+        {"title": "T", "structured_ingredients": [], "tokenized_directions": [],
+         "category_paths": None, "stale": None}
+    )
+    assert r.category_paths == []
+    assert r.stale is False
+
+
+def test_cayenne_recipe_servings_source_defaults_to_none_and_keeps_the_four():
+    base = {"title": "T", "structured_ingredients": [], "tokenized_directions": []}
+    assert CayenneRecipe.model_validate(base).servings_source is None
+    for v in ("stated", "counted", "tin", "estimated"):
+        assert CayenneRecipe.model_validate({**base, "servings_source": v}).servings_source == v
+
+
+def test_cayenne_recipe_nulls_an_unknown_servings_source():
+    base = {"title": "T", "structured_ingredients": [], "tokenized_directions": []}
+    assert CayenneRecipe.model_validate({**base, "servings_source": "guessed"}).servings_source is None
+    assert CayenneRecipe.model_validate({**base, "servings_source": 3}).servings_source is None
+    assert CayenneRecipe.model_validate({**base, "servings_source": ["tin"]}).servings_source is None
+
+
+def test_refinement_base_servings_says_stated_or_estimated():
+    desc = CayenneRefinement.model_fields["base_servings"].description
+    assert desc == (
+        "How many people one batch of this recipe serves. When the recipe states servings, that "
+        "number; otherwise your best estimate for a home cook from the whole recipe. Never the "
+        "number of cakes, loaves, tins, pans or jars it makes."
+    )

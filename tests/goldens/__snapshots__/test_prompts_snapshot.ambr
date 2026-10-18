@@ -114,6 +114,7 @@
        the step, so two mentions with the same words can be told apart.
      - "ingredient_id" is the id of the ingredient line the words refer to.
      - A heading step ("**Phase 1**") has no mentions.
+     - A heading line is never a mention: no "ingredient_id" may name a line marked (heading).
      - Say how much of the ingredient each mention uses, as "use":
          * all  - the whole amount the ingredient line gives goes in here, at once. Only the FIRST
            time it does: later mentions of the same food ("drain the rice", "until the rice is
@@ -238,12 +239,18 @@
   
   RULES:
   1. STRUCTURED INGREDIENTS:
-     - Assign each ingredient a unique ID (ing_01, ing_02, etc.).
+     - Assign each entry a unique ID (ing_01, ing_02, etc.).
      - Extract numeric "amount", "unit" (null if unitless), and "name".
      - "fallback_string" is the original full line, unchanged.
-     - "line_index" is the 0-based position of the source line in the RAW RECIPE
-       ingredients list. Every ingredient line gets exactly one entry with its
-       index. A section header line (e.g. "For the sauce:") gets no entry.
+     - Every line of the ingredients list gets exactly one entry, in the order the lines appear,
+       and "line_index" is that line's 0-based position in the RAW RECIPE ingredients list.
+     - "kind": "heading" for a line that names a part of the recipe and lists nothing to buy:
+       "For the sauce:", "PUDDING", "To serve:", "Garnish", a bold phase such as "**Phase 1**".
+       "kind": "ingredient" for every other line, including a food with no amount
+       ("Butter for greasing", "Salt to taste", "To serve: crusty bread").
+     - A heading has "name" set to its words without emphasis or a trailing colon, "fallback_string"
+       the line unchanged, and "amount", "unit", "converted_amount", "converted_unit", "state" null.
+       Number headings in the same ing_01, ing_02 sequence as ingredients.
      - STATE: for every ingredient with an amount and a volume or weight unit, say whether it is
        "liquid" - pourable as the recipe uses it: water, milk, cream, stock, oil, wine, juice,
        vinegar, honey, syrup, melted butter - or "solid" - everything else, including flour,
@@ -295,15 +302,36 @@
          "Add about 1/2 cup (60 g) flour" -> "Add about {{ing_02|1/2 cup (60 g)|0.5 cup}} flour"
          "Add the remaining flour" -> "Add the remaining {{ing_02|flour|rest}}"
          "Add more flour until sticky" -> "Add more {{ing_02|flour|none}} until sticky"
+     - TEMPERATURES: wrap every temperature a direction states - an oven, a grill, frying oil, sugar,
+       water, proving, a core temperature ("until the centre reads 63°C"), a fridge or a freezer - in a
+       temperature token {{temp:VALUE|words}}. The words are the direction's own, copied exactly,
+       and the whole run when it gives one setting several ways: "180°C/160°C fan/gas mark 4" is ONE
+       token. VALUE is what the writer meant, in the writer's own unit:
+         * the figure: a number and C or F ("180C", "350F"), or a Gas Mark ("gas4", "gas0.5", "gas0.25");
+         * then ",oven" when it is an oven setting (bake, roast, preheat, a described oven);
+         * then ",fan=160C" (or F) when the writer also gives the fan-oven figure;
+         * "fan=160C" alone when the writer gives only a fan-oven figure.
+         * ",core" (and nothing else after the figure) when it is the food's internal temperature,
+           the doneness check: "until the centre reads 200°F", "an internal temperature of 93°C".
+       A number with no unit ("bake at 180") or a described oven: decide from the recipe and its
+       SOURCE SYSTEM; a described oven is slow 150C, moderate 180C, hot 220C, very hot 230C, each
+       with ",oven". Never wrap a range ("170-180°C") or words with no figure ("room temperature",
+       "warm", "lukewarm").
+     - Examples:
+         "Preheat the oven to 350°F" -> "Preheat the oven to {{temp:350F,oven|350°F}}"
+         "Bake at 180°C/160°C fan/gas mark 4" -> "Bake at {{temp:180C,oven,fan=160C|180°C/160°C fan/gas mark 4}}"
+         "Heat the oil to 180C" -> "Heat the oil to {{temp:180C|180C}}"
+         "Bake in a moderate oven" -> "Bake in a {{temp:180C,oven|moderate oven}}"
+         "Bake until it reads 93°C in the centre" -> "Bake until it reads {{temp:93C,core|93°C}} in the centre"
   
   3. PHASES:
      - If the raw recipe groups its ingredients or directions into phases,
        stages, or days (a bold heading entry such as "**Phase 1**", "**Day 1**",
        "**Soaker**"), keep every one of those headings as its own entry, in
        place, in both lists.
-     - A heading is not an ingredient: give it no amount, no unit, and no fat
-       tokens. Carry the heading text through as the entry's fallback_string
-       (ingredients) or text (directions).
+     - A heading is not an ingredient: in the ingredients list it is an entry with "kind": "heading"
+       (rule 1); in the directions it is a step whose text is the heading, with no fat tokens.
+       Never put a heading's id in a fat token.
      - Do NOT flatten, merge, renumber, or drop a phase. The reader must still
        be able to tell where one session ends and the next begins.
   
@@ -324,7 +352,66 @@
        the SOURCE HOST exactly as given. One short quote.
      - Leave both null when nothing above applies.
   
-  5. REVIEW NOTES:
+  5. TINS AND BAKING:
+     - "pans": every baking tin, pan, tray or dish the recipe names with a size, in order of first
+       mention, ids pan_01, pan_02, ... One entry per size: "two 20cm sandwich tins" is ONE entry with
+       "count": 2. "raw" is the recipe's words, copied exactly.
+     - "shape": one of round, square, rect, loaf, ring, flat-round, sheet. "family": one of round-cake, square, traybake, sheet, loaf, ring, tart, pizza, stovetop.
+     - "family" stovetop: a frying pan, skillet, sauté pan, wok, paella pan, omelette or pancake pan,
+       griddle, saucepan, pot or lidded casserole pot such as a Dutch oven, whether the recipe uses it
+       on the hob or in the oven; a baking dish, even one called a casserole dish, is not stovetop.
+     - A baking, ovenproof, gratin, casserole or pie dish takes the family of its shape: rectangular
+       traybake, square square, round round-cake, a pie dish tart. When the recipe offers a choice
+       ("8-inch square or round baking dish", "8x12 or 9x13-inch dish"), use the first size and shape it names.
+       A rectangle is traybake, never square: square only when its sides are equal (a 9 x 13-inch dish or
+       pan is traybake).
+     - "dims_mm": inside size in MILLIMETRES (inches x 25.4): "d" for a round, "l" and "w" for a
+       rectangle, square or loaf; "depth" only when the recipe states it. Never guess a size.
+     - "capacity_ml" only when the recipe names the tin by volume ("a 1.5 litre tin", "a 10-cup Bundt").
+     - "catalog_hint" only for a tin the recipe names WITHOUT a size, from this list, else null:
+       uk-loaf-1lb, uk-loaf-2lb, us-bundt-6, us-bundt-10, us-bundt-12, us-tube-10, us-jellyroll, us-quarter-sheet, us-half-sheet, us-rect-13x9, uk-traybake-30x23, uk-swissroll-33x23, eu-blech-40x30, eu-gugelhupf-22, au-lamington-30x20, au-slab-30x20, au-bar-25x8.
+     - A tin with no size and none of those names ("a cake tin", "a baking dish") is not listed.
+     - In the directions, wrap the words naming each listed tin in a tin token {{pan_01|words}},
+       copying the words exactly: "Grease two 20cm sandwich tins" -> "Grease {{pan_01|two 20cm sandwich tins}}".
+       Wrap the first mention in each step only.
+     - "bake_type": one of sponge, butter-cake, quick-bread, bar, bread-lean, bread-enriched, cheesecake, custard, pizza, pie-fruit, pie-custard, pie-nut, pie-savoury, or null. Decide by how the item is made, not by its name, and
+       take the first that fits, in this order:
+       1. pizza: a yeast-dough base baked flat under its toppings.
+       2. cheesecake: a filling that is mostly soft cheese (cream cheese, ricotta, quark) set with eggs.
+       3. a pie or tart, never a recipe for pastry or dough alone: a pastry or crumb crust holds the
+          filling, or a lid of pastry, a suet crust or mashed potato covers it. A sweet filling is never
+          pie-savoury, whatever the crust (hot water, suet or shortcrust).
+          pie-custard: the filling is mostly egg with milk or cream and sets as it bakes (custard tart,
+          quiche, pumpkin and sweet potato pie, lemon meringue). pie-nut: a sugar-syrup, nut or frangipane
+          filling (pecan pie, treacle tart, butter tart, Bakewell tart). pie-fruit: a sweet fruit filling
+          (apple pie, mince pies, tarte tatin, sweet fruit galettes), sweet suet puddings and fruit-filled
+          pastries (Sussex pond pudding, Eccles cakes, black bun), and fruit baked under a crumble, crisp or
+          cobbler topping with no crust. pie-savoury: a savoury filling in or under pastry, a suet crust or
+          mashed potato (meat and pot pies, pasties, empanadas, sausage rolls, beef Wellington, steak and
+          kidney pudding, savoury tarts and galettes), and fish or meat under a mashed-potato lid (shepherd's,
+          cottage and fish pie): a mashed-potato lid is not a topping. Never pie-savoury: a dish topped with cheese, sauce or breadcrumbs (lasagne,
+          moussaka, enchiladas, gratins, aubergine parmigiana), or anything sweet.
+       4. custard: an egg-set liquid baked with no crust (baked custard, crème caramel, crème brûlée,
+          bread and butter pudding, clafoutis, baked rice pudding).
+       5. bread-enriched / bread-lean: risen with yeast or a sourdough starter. bread-enriched when the
+          dough has egg, or more than a spoonful of butter, oil, sugar or milk (brioche, challah, buns,
+          rolls, babka, stollen, yeast cakes); otherwise bread-lean (baguette, sourdough, ciabatta, pitta).
+       6. quick-bread: a bread, loaf, muffin or scone raised with baking powder or soda (banana bread,
+          muffins, scones, soda bread, cornbread), and popovers, Yorkshire puddings and toad in the hole.
+       7. butter-cake: a cake raised with baking powder or soda, its fat creamed, melted or oil (layer,
+          pound, Bundt, loaf, fruit, carrot, gingerbread and upside-down cakes, cupcakes, steamed sponge
+          puddings). A creamed cake
+          is butter-cake even when it is called a sponge (Victoria sponge).
+       8. sponge: a cake risen by eggs whisked to a foam, with little or no fat (génoise, Swiss roll,
+          fatless sponge, angel food, chiffon).
+       9. bar: a batter or dough baked in one pan and cut into pieces (brownies, blondies, flapjacks,
+          shortbread slices).
+       null: anything else, including roast meat, casseroles, cookies baked as separate pieces,
+       meringues and pavlova, granola, crackers, and anything cooked on the hob.
+     - "bake_step": the 0-based position in tokenized_directions (the first step is 0, not 1) of the
+       step that bakes the main item, or null.
+  
+  6. REVIEW NOTES:
      - "review_notes": what the cook checking this recipe should know, as a list of
        {"kind": ..., "text": ...} entries, each text one plain sentence naming the exact words concerned.
      - "needs_review": something the cook should check or fix: a quantity given only in the
@@ -351,12 +438,18 @@
   
   RULES:
   1. STRUCTURED INGREDIENTS:
-     - Assign each ingredient a unique ID (ing_01, ing_02, etc.).
+     - Assign each entry a unique ID (ing_01, ing_02, etc.).
      - Extract numeric "amount", "unit" (null if unitless), and "name".
      - "fallback_string" is the original full line, unchanged.
-     - "line_index" is the 0-based position of the source line in the RAW RECIPE
-       ingredients list. Every ingredient line gets exactly one entry with its
-       index. A section header line (e.g. "For the sauce:") gets no entry.
+     - Every line of the ingredients list gets exactly one entry, in the order the lines appear,
+       and "line_index" is that line's 0-based position in the RAW RECIPE ingredients list.
+     - "kind": "heading" for a line that names a part of the recipe and lists nothing to buy:
+       "For the sauce:", "PUDDING", "To serve:", "Garnish", a bold phase such as "**Phase 1**".
+       "kind": "ingredient" for every other line, including a food with no amount
+       ("Butter for greasing", "Salt to taste", "To serve: crusty bread").
+     - A heading has "name" set to its words without emphasis or a trailing colon, "fallback_string"
+       the line unchanged, and "amount", "unit", "converted_amount", "converted_unit", "state" null.
+       Number headings in the same ing_01, ing_02 sequence as ingredients.
      - STATE: for every ingredient with an amount and a volume or weight unit, say whether it is
        "liquid" - pourable as the recipe uses it: water, milk, cream, stock, oil, wine, juice,
        vinegar, honey, syrup, melted butter - or "solid" - everything else, including flour,
@@ -408,15 +501,36 @@
          "Add about 1/2 cup (60 g) flour" -> "Add about {{ing_02|1/2 cup (60 g)|0.5 cup}} flour"
          "Add the remaining flour" -> "Add the remaining {{ing_02|flour|rest}}"
          "Add more flour until sticky" -> "Add more {{ing_02|flour|none}} until sticky"
+     - TEMPERATURES: wrap every temperature a direction states - an oven, a grill, frying oil, sugar,
+       water, proving, a core temperature ("until the centre reads 63°C"), a fridge or a freezer - in a
+       temperature token {{temp:VALUE|words}}. The words are the direction's own, copied exactly,
+       and the whole run when it gives one setting several ways: "180°C/160°C fan/gas mark 4" is ONE
+       token. VALUE is what the writer meant, in the writer's own unit:
+         * the figure: a number and C or F ("180C", "350F"), or a Gas Mark ("gas4", "gas0.5", "gas0.25");
+         * then ",oven" when it is an oven setting (bake, roast, preheat, a described oven);
+         * then ",fan=160C" (or F) when the writer also gives the fan-oven figure;
+         * "fan=160C" alone when the writer gives only a fan-oven figure.
+         * ",core" (and nothing else after the figure) when it is the food's internal temperature,
+           the doneness check: "until the centre reads 200°F", "an internal temperature of 93°C".
+       A number with no unit ("bake at 180") or a described oven: decide from the recipe and its
+       SOURCE SYSTEM; a described oven is slow 150C, moderate 180C, hot 220C, very hot 230C, each
+       with ",oven". Never wrap a range ("170-180°C") or words with no figure ("room temperature",
+       "warm", "lukewarm").
+     - Examples:
+         "Preheat the oven to 350°F" -> "Preheat the oven to {{temp:350F,oven|350°F}}"
+         "Bake at 180°C/160°C fan/gas mark 4" -> "Bake at {{temp:180C,oven,fan=160C|180°C/160°C fan/gas mark 4}}"
+         "Heat the oil to 180C" -> "Heat the oil to {{temp:180C|180C}}"
+         "Bake in a moderate oven" -> "Bake in a {{temp:180C,oven|moderate oven}}"
+         "Bake until it reads 93°C in the centre" -> "Bake until it reads {{temp:93C,core|93°C}} in the centre"
   
   3. PHASES:
      - If the raw recipe groups its ingredients or directions into phases,
        stages, or days (a bold heading entry such as "**Phase 1**", "**Day 1**",
        "**Soaker**"), keep every one of those headings as its own entry, in
        place, in both lists.
-     - A heading is not an ingredient: give it no amount, no unit, and no fat
-       tokens. Carry the heading text through as the entry's fallback_string
-       (ingredients) or text (directions).
+     - A heading is not an ingredient: in the ingredients list it is an entry with "kind": "heading"
+       (rule 1); in the directions it is a step whose text is the heading, with no fat tokens.
+       Never put a heading's id in a fat token.
      - Do NOT flatten, merge, renumber, or drop a phase. The reader must still
        be able to tell where one session ends and the next begins.
   
@@ -437,7 +551,66 @@
        the SOURCE HOST exactly as given. One short quote.
      - Leave both null when nothing above applies.
   
-  5. REVIEW NOTES:
+  5. TINS AND BAKING:
+     - "pans": every baking tin, pan, tray or dish the recipe names with a size, in order of first
+       mention, ids pan_01, pan_02, ... One entry per size: "two 20cm sandwich tins" is ONE entry with
+       "count": 2. "raw" is the recipe's words, copied exactly.
+     - "shape": one of round, square, rect, loaf, ring, flat-round, sheet. "family": one of round-cake, square, traybake, sheet, loaf, ring, tart, pizza, stovetop.
+     - "family" stovetop: a frying pan, skillet, sauté pan, wok, paella pan, omelette or pancake pan,
+       griddle, saucepan, pot or lidded casserole pot such as a Dutch oven, whether the recipe uses it
+       on the hob or in the oven; a baking dish, even one called a casserole dish, is not stovetop.
+     - A baking, ovenproof, gratin, casserole or pie dish takes the family of its shape: rectangular
+       traybake, square square, round round-cake, a pie dish tart. When the recipe offers a choice
+       ("8-inch square or round baking dish", "8x12 or 9x13-inch dish"), use the first size and shape it names.
+       A rectangle is traybake, never square: square only when its sides are equal (a 9 x 13-inch dish or
+       pan is traybake).
+     - "dims_mm": inside size in MILLIMETRES (inches x 25.4): "d" for a round, "l" and "w" for a
+       rectangle, square or loaf; "depth" only when the recipe states it. Never guess a size.
+     - "capacity_ml" only when the recipe names the tin by volume ("a 1.5 litre tin", "a 10-cup Bundt").
+     - "catalog_hint" only for a tin the recipe names WITHOUT a size, from this list, else null:
+       uk-loaf-1lb, uk-loaf-2lb, us-bundt-6, us-bundt-10, us-bundt-12, us-tube-10, us-jellyroll, us-quarter-sheet, us-half-sheet, us-rect-13x9, uk-traybake-30x23, uk-swissroll-33x23, eu-blech-40x30, eu-gugelhupf-22, au-lamington-30x20, au-slab-30x20, au-bar-25x8.
+     - A tin with no size and none of those names ("a cake tin", "a baking dish") is not listed.
+     - In the directions, wrap the words naming each listed tin in a tin token {{pan_01|words}},
+       copying the words exactly: "Grease two 20cm sandwich tins" -> "Grease {{pan_01|two 20cm sandwich tins}}".
+       Wrap the first mention in each step only.
+     - "bake_type": one of sponge, butter-cake, quick-bread, bar, bread-lean, bread-enriched, cheesecake, custard, pizza, pie-fruit, pie-custard, pie-nut, pie-savoury, or null. Decide by how the item is made, not by its name, and
+       take the first that fits, in this order:
+       1. pizza: a yeast-dough base baked flat under its toppings.
+       2. cheesecake: a filling that is mostly soft cheese (cream cheese, ricotta, quark) set with eggs.
+       3. a pie or tart, never a recipe for pastry or dough alone: a pastry or crumb crust holds the
+          filling, or a lid of pastry, a suet crust or mashed potato covers it. A sweet filling is never
+          pie-savoury, whatever the crust (hot water, suet or shortcrust).
+          pie-custard: the filling is mostly egg with milk or cream and sets as it bakes (custard tart,
+          quiche, pumpkin and sweet potato pie, lemon meringue). pie-nut: a sugar-syrup, nut or frangipane
+          filling (pecan pie, treacle tart, butter tart, Bakewell tart). pie-fruit: a sweet fruit filling
+          (apple pie, mince pies, tarte tatin, sweet fruit galettes), sweet suet puddings and fruit-filled
+          pastries (Sussex pond pudding, Eccles cakes, black bun), and fruit baked under a crumble, crisp or
+          cobbler topping with no crust. pie-savoury: a savoury filling in or under pastry, a suet crust or
+          mashed potato (meat and pot pies, pasties, empanadas, sausage rolls, beef Wellington, steak and
+          kidney pudding, savoury tarts and galettes), and fish or meat under a mashed-potato lid (shepherd's,
+          cottage and fish pie): a mashed-potato lid is not a topping. Never pie-savoury: a dish topped with cheese, sauce or breadcrumbs (lasagne,
+          moussaka, enchiladas, gratins, aubergine parmigiana), or anything sweet.
+       4. custard: an egg-set liquid baked with no crust (baked custard, crème caramel, crème brûlée,
+          bread and butter pudding, clafoutis, baked rice pudding).
+       5. bread-enriched / bread-lean: risen with yeast or a sourdough starter. bread-enriched when the
+          dough has egg, or more than a spoonful of butter, oil, sugar or milk (brioche, challah, buns,
+          rolls, babka, stollen, yeast cakes); otherwise bread-lean (baguette, sourdough, ciabatta, pitta).
+       6. quick-bread: a bread, loaf, muffin or scone raised with baking powder or soda (banana bread,
+          muffins, scones, soda bread, cornbread), and popovers, Yorkshire puddings and toad in the hole.
+       7. butter-cake: a cake raised with baking powder or soda, its fat creamed, melted or oil (layer,
+          pound, Bundt, loaf, fruit, carrot, gingerbread and upside-down cakes, cupcakes, steamed sponge
+          puddings). A creamed cake
+          is butter-cake even when it is called a sponge (Victoria sponge).
+       8. sponge: a cake risen by eggs whisked to a foam, with little or no fat (génoise, Swiss roll,
+          fatless sponge, angel food, chiffon).
+       9. bar: a batter or dough baked in one pan and cut into pieces (brownies, blondies, flapjacks,
+          shortbread slices).
+       null: anything else, including roast meat, casseroles, cookies baked as separate pieces,
+       meringues and pavlova, granola, crackers, and anything cooked on the hob.
+     - "bake_step": the 0-based position in tokenized_directions (the first step is 0, not 1) of the
+       step that bakes the main item, or null.
+  
+  6. REVIEW NOTES:
      - "review_notes": what the cook checking this recipe should know, as a list of
        {"kind": ..., "text": ...} entries, each text one plain sentence naming the exact words concerned.
      - "needs_review": something the cook should check or fix: a quantity given only in the
@@ -474,6 +647,34 @@
   PLACEHOLDER CHUNK BODY — fixed text so the snapshot only moves when the template does.
   '''
 # ---
+# name: TestPromptSnapshots.test_temperatures_prompt
+  '''
+  
+  You are a culinary data refiner. Find every temperature these recipe directions state that is not
+  already written with its unit, and say what the writer meant.
+  
+  RULES:
+     - Report every temperature figure with no C or F after it ("bake at 180", "350 degrees", "375°",
+       "a 400° oven", "preheat to 425") and every described oven ("a moderate oven", "a hot oven"). A
+       degree sign alone is not a unit. Skip anything inside {{ }} and any figure already followed
+       by C, F, Celsius or Fahrenheit.
+     - "quote" is the words to wrap, copied character for character from that step; "context" is the
+       quote with about five words around it, copied the same way.
+     - "value" is what the writer meant, in the writer's unit: a number and C or F ("180C", "350F"),
+       then ",oven" when it is an oven setting. Decide the unit from the SOURCE SYSTEM and the figure:
+       US recipes write Fahrenheit; UK, EU and AU recipes write Celsius; an oven figure above 260 is
+       Fahrenheit. A described oven is slow 150C, moderate 180C, hot 220C, very hot 230C, each with ",oven".
+     - Never report a range ("170-180"), an angle ("turn it 90°"), a time, a weight, a size or a count.
+     - An oven, grill or baking figure is always reported, even when the unit must be inferred.
+  
+  SOURCE SYSTEM: UK
+  
+  DIRECTIONS:
+    1. Bake in a moderate oven.
+    2. Serve.
+  
+  '''
+# ---
 # name: TestPromptSnapshots.test_toc_classify_prompt
   '''
   Given this list of table-of-contents entries from a cookbook, identify which ones are
@@ -508,6 +709,148 @@
 # name: TestSchemaSnapshots.test_cayenne_refinement_schema
   dict({
     '$defs': dict({
+      'PanDims': dict({
+        'description': "A tin's inside size in millimetres.",
+        'properties': dict({
+          'd': dict({
+            'anyOf': list([
+              dict({
+                'type': 'number',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': 'Diameter, for a round tin.',
+            'title': 'D',
+          }),
+          'depth': dict({
+            'anyOf': list([
+              dict({
+                'type': 'number',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': 'Depth, only if the recipe states it.',
+            'title': 'Depth',
+          }),
+          'l': dict({
+            'anyOf': list([
+              dict({
+                'type': 'number',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': 'Length, for a rectangle or loaf.',
+            'title': 'L',
+          }),
+          'w': dict({
+            'anyOf': list([
+              dict({
+                'type': 'number',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': 'Width, for a rectangle or loaf.',
+            'title': 'W',
+          }),
+        }),
+        'title': 'PanDims',
+        'type': 'object',
+      }),
+      'RecipePan': dict({
+        'description': 'One kind of tin a recipe bakes in.',
+        'properties': dict({
+          'capacity_ml': dict({
+            'anyOf': list([
+              dict({
+                'type': 'number',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': "Only when the recipe names the tin by volume ('a 1.5 litre tin', 'a 10-cup Bundt').",
+            'title': 'Capacity Ml',
+          }),
+          'catalog_hint': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': 'Only for the named tins listed in the prompt; otherwise null.',
+            'title': 'Catalog Hint',
+          }),
+          'count': dict({
+            'default': 1,
+            'description': 'How many of this tin the recipe uses (two 20 cm tins → 2).',
+            'title': 'Count',
+            'type': 'integer',
+          }),
+          'dims_mm': dict({
+            '$ref': '#/$defs/PanDims',
+            'description': 'Inside size in millimetres (inches × 25.4): d for a round, l and w for a rectangle or loaf, depth only if the recipe states it.',
+          }),
+          'family': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': 'round-cake, square, traybake, sheet, loaf, ring, tart, pizza, stovetop; null if unknown.',
+            'title': 'Family',
+          }),
+          'id': dict({
+            'description': 'pan_01, pan_02, … in order of first mention.',
+            'title': 'Id',
+            'type': 'string',
+          }),
+          'raw': dict({
+            'description': "The recipe's words naming the tin(s), copied exactly.",
+            'title': 'Raw',
+            'type': 'string',
+          }),
+          'shape': dict({
+            'anyOf': list([
+              dict({
+                'type': 'string',
+              }),
+              dict({
+                'type': 'null',
+              }),
+            ]),
+            'default': None,
+            'description': 'round, square, rect, loaf, ring, flat-round, sheet; null if unknown.',
+            'title': 'Shape',
+          }),
+        }),
+        'required': list([
+          'id',
+          'raw',
+        ]),
+        'title': 'RecipePan',
+        'type': 'object',
+      }),
       'ReviewNote': dict({
         'description': 'One observation REFINE makes about a recipe for the person checking it.',
         'properties': dict({
@@ -586,6 +929,15 @@
             'title': 'Is Ai Converted',
             'type': 'boolean',
           }),
+          'kind': dict({
+            'description': '"heading" for a line that names a part of the recipe and lists nothing to buy ("For the sauce:", "PUDDING", "To serve:"); "ingredient" for every other line, including a food with no amount ("Butter for greasing").',
+            'enum': list([
+              'ingredient',
+              'heading',
+            ]),
+            'title': 'Kind',
+            'type': 'string',
+          }),
           'line_index': dict({
             'anyOf': list([
               dict({
@@ -596,7 +948,7 @@
               }),
             ]),
             'default': None,
-            'description': '0-based index of the raw ingredient line this entry was parsed from. Every ingredient line yields exactly one entry; section-header lines yield none. null only when the entry is not tied to a single line.',
+            'description': '0-based index of the raw ingredient line this entry was parsed from. Every line, heading or ingredient, yields exactly one entry. null only when the entry is not tied to a single line.',
             'title': 'Line Index',
           }),
           'name': dict({
@@ -637,6 +989,7 @@
         }),
         'required': list([
           'id',
+          'kind',
           'name',
           'fallback_string',
         ]),
@@ -651,7 +1004,7 @@
             'type': 'integer',
           }),
           'text': dict({
-            'description': "Direction text with Fat Tokens {{id|words|use}}: words exactly as written, use one of all, rest, none, or an amount such as '0.5 cup'.",
+            'description': "Direction text with Fat Tokens {{id|words|use}}: words exactly as written, use one of all, rest, none, or an amount such as '0.5 cup'; and temperature tokens {{temp:VALUE|words}}, VALUE such as '180C,oven,fan=160C', '350F' or 'gas4'.",
             'title': 'Text',
             'type': 'string',
           }),
@@ -666,6 +1019,32 @@
     }),
     'description': 'Internal refinement pass output.',
     'properties': dict({
+      'bake_step': dict({
+        'anyOf': list([
+          dict({
+            'type': 'integer',
+          }),
+          dict({
+            'type': 'null',
+          }),
+        ]),
+        'default': None,
+        'description': '0-based index into tokenized_directions of the step that bakes; null when nothing bakes.',
+        'title': 'Bake Step',
+      }),
+      'bake_type': dict({
+        'anyOf': list([
+          dict({
+            'type': 'string',
+          }),
+          dict({
+            'type': 'null',
+          }),
+        ]),
+        'default': None,
+        'description': "What the recipe bakes, one word from the prompt's list of 13 bake types; null when nothing bakes.",
+        'title': 'Bake Type',
+      }),
       'base_servings': dict({
         'anyOf': list([
           dict({
@@ -675,7 +1054,16 @@
             'type': 'null',
           }),
         ]),
+        'description': 'How many people one batch of this recipe serves. When the recipe states servings, that number; otherwise your best estimate for a home cook from the whole recipe. Never the number of cakes, loaves, tins, pans or jars it makes.',
         'title': 'Base Servings',
+      }),
+      'pans': dict({
+        'description': 'The tins the recipe bakes in; [] when none.',
+        'items': dict({
+          '$ref': '#/$defs/RecipePan',
+        }),
+        'title': 'Pans',
+        'type': 'array',
       }),
       'review_notes': dict({
         'description': 'Short notes for the cook reviewing this recipe: what is missing, ambiguous or worth checking, and what was observed. Empty when there is nothing to say.',
@@ -1071,6 +1459,57 @@
       'recipes',
     ]),
     'title': 'RecipeList',
+    'type': 'object',
+  })
+# ---
+# name: TestSchemaSnapshots.test_temperature_mentions_schema
+  dict({
+    '$defs': dict({
+      'TemperatureMention': dict({
+        'description': 'One temperature in a direction step, as the temperature backfill reports it (Cayenne oven temperatures).',
+        'properties': dict({
+          'context': dict({
+            'default': '',
+            'description': 'The quote with about five words around it, copied exactly from the step.',
+            'title': 'Context',
+            'type': 'string',
+          }),
+          'quote': dict({
+            'description': 'The words to wrap, copied exactly from that step.',
+            'title': 'Quote',
+            'type': 'string',
+          }),
+          'step': dict({
+            'description': '1-based number of the step the temperature is in.',
+            'title': 'Step',
+            'type': 'integer',
+          }),
+          'value': dict({
+            'description': "What the writer meant: '180C,oven', '350F', 'gas4', '180C,oven,fan=160C'.",
+            'title': 'Value',
+            'type': 'string',
+          }),
+        }),
+        'required': list([
+          'step',
+          'quote',
+          'value',
+        ]),
+        'title': 'TemperatureMention',
+        'type': 'object',
+      }),
+    }),
+    'description': "The temperature backfill's whole answer for one recipe.",
+    'properties': dict({
+      'mentions': dict({
+        'items': dict({
+          '$ref': '#/$defs/TemperatureMention',
+        }),
+        'title': 'Mentions',
+        'type': 'array',
+      }),
+    }),
+    'title': 'TemperatureMentions',
     'type': 'object',
   })
 # ---

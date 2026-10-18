@@ -11,9 +11,19 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from recipeparser.core.fat_tokens import TOKEN_RE, check_mentions
+from recipeparser.core.fat_tokens import (
+    TEMP_PREFIX,
+    TOKEN_RE,
+    check_mentions,
+    is_special_id,
+    is_temp_id,
+    parse_temp_value,
+)
+from recipeparser.core.headings import heading_name
 from recipeparser.core.numbers import written_measures
+from recipeparser.core.pans import apply_pan_checks, check_core_flags
 from recipeparser.core.rate_limiter import GlobalRateLimiter
+from recipeparser.core.temperatures import repair_tokens
 from recipeparser.gemini import refine_recipe_for_cayenne
 from recipeparser.models import SOURCE_SYSTEMS, CayenneRefinement, RecipeExtraction
 from recipeparser.utils import title_case
@@ -66,6 +76,84 @@ def _ensure_unique_ids(refinement: CayenneRefinement) -> None:
         log.warning("refine(): '%s': ingredient IDs made unique: %s", refinement.title, "; ".join(renamed))
 
 
+def _normalise_headings(refinement: CayenneRefinement) -> None:
+    """
+    Give every heading entry exactly the fields a heading has (ingredient headings D3), in place: no
+    quantity of any kind, and a display name cleaned from its source line. A heading that kept an
+    amount ("Day 2") would otherwise grow an amount control in the editor and a line on the
+    shopping list.
+    """
+    for ing in refinement.structured_ingredients:
+        if ing.kind != "heading":
+            continue
+        ing.amount = None
+        ing.unit = None
+        ing.converted_amount = None
+        ing.converted_unit = None
+        ing.is_ai_converted = False
+        ing.state = None
+        ing.name = heading_name(ing.fallback_string)
+
+
+def _unwrap_heading_tokens(refinement: CayenneRefinement) -> None:
+    """
+    Replace, in place, every Fat Token that names a heading with its words, and log each. A heading
+    is not an ingredient a step can use; the slip costs the chip, never the recipe (the same rule
+    ``_check_mentions`` follows).
+    """
+    headings = {ing.id for ing in refinement.structured_ingredients if ing.kind == "heading"}
+    if not headings:
+        return
+    unwrapped: List[str] = []
+
+    def unwrap(match: "re.Match[str]") -> str:
+        if match.group(1) not in headings:
+            return match.group(0)
+        unwrapped.append(match.group(0))
+        return match.group(2)
+
+    for step in refinement.tokenized_directions:
+        step.text = TOKEN_RE.sub(unwrap, step.text)
+    if unwrapped:
+        log.warning("refine(): '%s': tokens naming a heading unwrapped: %s", refinement.title, "; ".join(unwrapped))
+
+
+def _words_state_value(value: Any, words: str) -> bool:
+    """Words with figures must carry one of the value's (main, fan or Gas Mark); words without any
+    (a described oven) are taken as they are."""
+    figures = {int(n) for n in re.findall(r"\d+", words, re.ASCII)}
+    if not figures:
+        return True
+    wanted = {k for r in (value.main, value.fan) if r is not None for k in (int(r[1]), int(r[1]) + 1)
+              if k == r[1] or r[1] != int(r[1])}
+    return bool(figures & wanted)
+
+
+def _check_temperatures(refinement: CayenneRefinement, raw: RecipeExtraction) -> None:
+    """
+    Cayenne oven temperatures D15, in place: a temperature token's value must parse (a known unit, in
+    range) and its words must be words the recipe's directions write. One that fails is unwrapped to
+    its words with a warning: a model slip costs the conversion, never the recipe.
+    """
+    source = _plain("\n".join(raw.directions))
+    unwrapped: List[str] = []
+
+    def check(match: "re.Match[str]") -> str:
+        if not is_temp_id(match.group(1)):
+            return match.group(0)
+        value = parse_temp_value(match.group(1)[len(TEMP_PREFIX):])
+        if value is not None and _plain(match.group(2)) in source and _words_state_value(value, match.group(2)):
+            return match.group(0)
+        unwrapped.append(match.group(0))
+        return match.group(2)
+
+    for step in refinement.tokenized_directions:
+        # A bare "350" takes in the "degrees" after it; one end of a range is unwrapped (2026-10-13).
+        step.text = TOKEN_RE.sub(check, repair_tokens(step.text)[0])
+    if unwrapped:
+        log.warning("refine(): '%s': temperature token(s) unwrapped: %s", refinement.title, "; ".join(unwrapped))
+
+
 def _validate_fat_tokens(refinement: CayenneRefinement) -> None:
     """
     Verify that every Fat Token in tokenized_directions references a valid
@@ -74,6 +162,8 @@ def _validate_fat_tokens(refinement: CayenneRefinement) -> None:
     valid_ids = {ing.id for ing in refinement.structured_ingredients}
     for step in refinement.tokenized_directions:
         for match in TOKEN_RE.finditer(step.text):
+            if is_special_id(match.group(1)):
+                continue  # a temperature is checked by _check_temperatures; a tin names no ingredient
             token_id = match.group(1)
             if token_id not in valid_ids:
                 raise ValueError(
@@ -446,6 +536,15 @@ def refine(
     # the stored title and the embedded one agree.
     result.title = title_case(result.title)
     _ensure_unique_ids(result)
+    _normalise_headings(result)
+    _unwrap_heading_tokens(result)
+    # R-B: strip a misplaced ",core" first, or _check_temperatures unwraps the whole token.
+    result.tokenized_directions, core_warnings = check_core_flags(result.tokenized_directions)
+    for line in core_warnings:
+        log.warning("refine(): '%s': %s", result.title, line)
+    _check_temperatures(result, raw)
+    for line in apply_pan_checks(result, raw.directions):
+        log.warning("refine(): '%s': %s", result.title, line)
     _validate_fat_tokens(result)
     _check_mentions(result)
     _normalise_line_index(result, raw)

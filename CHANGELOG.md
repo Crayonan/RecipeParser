@@ -5,6 +5,199 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [9.17.1] — 2026-10-17
+
+Container and volume yields keep their own count and unit (Cayenne spec `docs/superpowers/specs/2026-10-16-scale-sheet-redesign-design.md` in IanDBallard/Cayenne, the owner's ruling D52). The 9.17.0 backfill's dry run over the live library (1,700 rows: 1,364 set, 336 by the model, 142 flagged for review) gave condiments, spice blends and preserves large model estimates: Garam Masala "1 cup" → 40, Tomato Ketchup "2 cups" → 32, marmalade "3–4 jars" → 40. Merging deploys (container restart). No schema change.
+
+### ⚠️ Changed
+- A yield whose unit is a container or a volume (jar, bottle, pot, tub, cup, pint, quart, gallon, litre/liter, l, ml, millilitre/milliliter, fl oz, fluid ounce, singular or plural) is `counted` and never sent to the tin table or the model. `base_servings` is the yield's count: a range's low end ("3–4 jars" is 3), the leading count rather than the size inside ("3 × 1½ lb jars" is 3, "2 × 500 ml jars" is 2), "a jar" is 1, and a volume with only a number keeps it ("750 ml" is 750). A fractional ml or litre count rounds half to even, as `parse_servings` and both twins round: "1.5 litres" is 2 and "2.5 litres" is 2. `servings_source` stays `counted`; the noun in `servings_note` tells a container from an item count, and `Classified.noun` carries it.
+- A stated serving still wins ("Serves 4 (makes 2 cups)" is stated 4; "1 jar, about 12 servings" is stated 12), and an item count beats a container count ("2 cups (about 24 truffles)" is counted 24, "4 cups, makes 16 muffins" is 16); the container rule applies only when no serving word or item count is present. Words with no container (loaf, batch, cake, tart, pan, tin) keep the tin or estimate path, and a bake noun beside a volume keeps it too ("1 x 2 litre dish").
+- Basins, moulds (molds), pudding basins and dishes are bake vessels: "1 x 1.2 litre pudding basin" and "a 2 litre dish" stay on the tin or estimate path. A stored approximate bare number ("1 jar, about 12") is treated as a lost serving number, so it falls to the bake path. Accepted edge: "makes 4 cups soup" steps in cups.
+- Cup, cups, quart(s), litre(s), liter(s), jar(s) and pint(s) are no longer bake nouns. The shared fixture `tests/fixtures/servings_source_cases.json` gains the container rows, and "Makes 4 cups", "3 jars" and "4 cups" move from `bake` to `counted`: Cayenne's TypeScript twin must take the same rule and the fixture copy together.
+
+### 🔧 Operational
+- Re-run the backfill's dry run before `--live`. 9.17.0's dry run wrote nothing, so every row is still unsourced and is classified afresh by this version (a re-run skips only rows that already have a source); the container rows now classify `counted` without asking the model, so fewer rows reach Gemini and the `check` list changes.
+
+---
+
+## [9.17.0] — 2026-10-16
+
+Servings at import, with their provenance (Cayenne spec `docs/superpowers/specs/2026-10-16-scale-sheet-redesign-design.md` in IanDBallard/Cayenne, D44, D47, D50 and *Estimating servings*). Every recipe now leaves ingest with a `base_servings` and a `servings_source` saying how it was reached: `stated` (the recipe says so), `counted` (it counts items), `tin` (worked out from the tins it names) or `estimated` (the model's guess, the last resort). Merging deploys (container restart). Deploy order: the Cayenne migration, then this version, then the backfill.
+
+### ⚠️ Requires — apply the Cayenne migration **before** deploying this version
+- `servings_source` on `recipes` (Cayenne scale-sheet plan, PR A). Every INSERT now writes the column, so against a schema without it PostgREST rejects the row and every ingest fails.
+
+### ✨ Added
+- `core/servings.py`: the deterministic yield rule. It classifies the yield text as stated, counted, the bake itself or none, and composes that with the tin table and the model's estimate. It shares `tests/fixtures/servings_source_cases.json` with the Cayenne TypeScript twin.
+- `core/tin_servings.py`: the tin table (`HINT_TINS`, equal to `tests/fixtures/hint_tins.json`, which Cayenne's drift test reads) and `estimate_from_tins`.
+- `servings_source` on `CayenneRecipe` and in the Supabase row; `ServingsSource` in the models.
+- `gemini.estimate_servings`, and `scripts/backfill_servings.py`, which gives every existing recipe its `servings_source` and corrects a `base_servings` that was a guess. The deterministic rule runs first; the model is asked only when the recipe's words and its tins give nothing.
+
+### ⚠️ Changed
+- REFINE's `base_servings` is now the model's estimate of the people one batch serves (never the number of cakes, loaves or tins), used only when the yield gives nothing.
+- A Cayenne restore keeps an exported `servings_source`; for an archive that predates it, it derives one without the model, so it still makes no AI call.
+- Singular item nouns are recognised at a count of one (cookie, brownie, blondie), after the bake nouns, so "1 swiss roll" and "1 bar cake" are the bake.
+- The yield rule takes the number next to a serving word ("Makes 1 loaf (serves 10)" is 10) and the number on an item noun anywhere ("2 loaves (24 slices)" is 24; a dozen is 12); a stored "12 one 9-inch pan" stays 12 servings; a method count needs a portion noun ("cut the butter into 8 pieces" is no count).
+- Ingest leaves `base_servings` null when nothing places it, rather than falling back to the yield's first number ("1 cake" was 1 serving).
+- The tin table skips a tin counted below one or with a non-finite or non-positive size; only round and square tins stack as layers (two 13x9 traybakes are 28).
+- The Paprika contract archive fixture carries `servings_source` (regenerated).
+
+### 🔧 Operational
+- Run the backfill in this order. Nothing is written until the third step.
+  1. Dry run: `python scripts/backfill_servings.py --all-users --review ../backfill-records/servings-review-<date>.csv`
+  2. The dry run still calls Gemini for rows the rule cannot place, so it needs `GOOGLE_API_KEY` (with `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`). Rows that are `stale` (`derived_rev < body_rev`) are skipped, not written, and appear in the review CSV with status `stale` and no moved_pct, for the regen worker to re-derive; once it has, re-run the backfill (it skips sourced rows). Read the CSV and review the `check` rows (those that move more than 25%, and those that read as stated but now fall to the tins or the model, even at the same base).
+  3. For real: `python scripts/backfill_servings.py --all-users --live --record ../backfill-records/servings-before-<date>.csv`. Rows the rule cannot place are asked of the model again in the live run, so a model value may differ from the one in the dry run's CSV.
+- Without `--force`, a re-run skips rows that already have a source; a `stated` row is never touched, `--force` or not. To undo a run: `python scripts/backfill_servings.py --all-users --restore ../backfill-records/servings-before-<date>.csv --live`.
+
+---
+
+## [9.16.0] — 2026-10-16
+
+Lossless Cayenne restore (Cayenne spec `docs/superpowers/specs/2026-10-16-paprika-export-design.md` in IanDBallard/Cayenne, plan B). A `.paprikarecipes` file exported by Cayenne now restores into a fresh account exactly as it was written, with no AI call and no allowance spent. Merging deploys (container restart); deploy before the owner's restore check (export, then restore into a fresh account, with no AI usage recorded). It can merge before or after the Cayenne client PR: older clients never send version 2.
+
+### ✨ Added
+- `_cayenne_meta` version 2 restore fields on `CayenneRecipe`: `is_favourite`, `category_paths`, `source_uom_system`, `image_source`, `stale`; `RecipePan.removed`. Version 1 entries still read.
+- Category creation: a restore creates the category paths the new account lacks, level by level, reusing a name that exists anywhere (`restore_paths.py`). A category-creation failure logs and continues; the recipes still import, linked by leaf name.
+- Picture copy: a bucket picture is downloaded from the old address and stored in the new account (`picture_copy.py`).
+
+### 🐛 Fixed
+- The cook's title is kept as written, not title-cased.
+- For version 2 entries, the nine time spans and the base servings are restored as exported, not re-derived. A pre-v2 archive still re-derives them from the recipe text.
+- The measuring system (`source_uom_system`) and `image_source` are written to their columns.
+- Removed tins are no longer revived: `removed` is kept out of both Gemini schemas (`schema_without_client_fields`; see the Cayenne spec above).
+- Stale rows restore stale (`body_rev` 1, `derived_rev` 0).
+
+### ⚠️ Changed
+- A corrupt `_cayenne_meta` entry is skipped, not re-extracted: it is one skipped line, never sent to the AI pipeline (see the Cayenne spec above). Embeddings are kept only when exactly 1536 finite numbers.
+- A failed picture copy (log warning, old address dropped) and a category path too deep (reported as a refused link) are not skipped lines, so the client does not read them as "a section that produced no recipe". A failed copy also clears `image_source`, so a row is never left with no picture but a `generated` source.
+- `category_paths` and `stale` read `null` as `[]` and `false`, so a v2 entry carrying null is restored rather than skipped.
+- A restore cleans category path names in one shared helper (strip, drop empty) for both the creation and the link lookup, so a padded name still links.
+- The bucket-picture source (a Supabase client) is built only for a job that has a Cayenne restore chunk; URL and EPUB jobs never build it.
+
+---
+
+## [9.15.0] — 2026-10-16
+
+Households (Cayenne spec `2026-10-01-household-shopping-design.md`, Part 3; plan `2026-10-14-household-stage-3b-recipeparser.md`). Six endpoints let a household of Cayenne accounts share one shopping list. Each is one JWT-verified call to one Cayenne database function, which is the transaction.
+
+### ⚠️ Requires — apply the Cayenne migration **before** deploying this version
+- `20261016090000_household_membership.sql` (Cayenne Stage 3a, [Cayenne#303](https://github.com/IanDBallard/Cayenne/pull/303)): `household_invites`, `household_links` and the membership functions. It is already live in production (2026-10-15). Order: Cayenne 3a live, then this deploy, then Cayenne 3c (the client).
+
+### ✨ Added
+- `recipeparser/adapters/household_api.py`, registered from `api.py` with one `include_router`. It shares the share endpoints' recipient-check limiter (20 lookups an hour) and their idempotency cache. The endpoints:
+  - `POST /household/invites`
+  - `POST /household/invites/{id}/accept`, `/decline` and `/cancel`
+  - `POST /household/leave`
+  - `POST /household/members/{user_id}/remove`
+  - `POST /household/copy`
+- Each Postgres refusal maps to its own status and sentence (409 already a member or already invited; 422 household full; 409 leaving a household of one). Any other database error is a 503, never a misleading 404.
+- The share worker's sweep also expires and purges household invites, on the share timers (every 15 minutes, and daily).
+
+---
+
+## [9.14.0] — 2026-10-15
+
+AI caps for the beta (Cayenne spec `2026-10-15-ai-caps-and-invite-gate-design.md`, D2–D10). Every Gemini call is recorded in `ai_usage` against its user and action. The kill switch (`ai_settings.paused`) refuses AI work for everyone but exempt accounts. An import stops at the account's `recipe_cap` and finishes `done` with a note (a Cayenne restore never counts against it). Search embeds are limited to 60 a minute per user.
+
+### ⚠️ Requires — apply the Cayenne migration **before** deploying this version
+- `*_ai_allowance.sql` (AI caps plan A): `ai_allowance`, `ai_usage`, `ai_settings`, `consume_recipe_allowance`. Without it every AI request is refused as paused, because the allowance row is missing and the gate fails closed.
+
+### ✨ Added
+- `recipeparser/usage.py`: per-request attribution; picture generation now records its tokens too.
+- `recipeparser/adapters/ai_gate.py`: 503 when paused, 429 at the cap and over the search rate. Never 403.
+- `JobSink`: one allowance spent per AI-made recipe. Cayenne restores spend none.
+- The regeneration and re-categorise workers are attributed, and wait out a pause for non-exempt owners.
+- A recipe refused at the cap is neither written nor tagged, so no AI is spent on it after the cap.
+- A `.paprikarecipes` upload is gated after it is read, and only when some recipe in it needs AI, so a Cayenne restore runs even at the cap, and while paused when it carries its stored embeddings (owner ruling; a restore without them calls EMBED, which the pause covers and the cap does not). Every other upload and `POST /jobs` are still refused at the endpoint; a refused Paprika export finishes `error` with the same sentence.
+- While paused, a regeneration row whose owner isn't exempt is left to its claim lease rather than released, so exempt owners' rows keep moving.
+
+## [9.13.2] — 2026-10-15
+
+### 🐛 Fixed
+- A baking dish now gets a tin family. The tin rules named tins and pans but never dishes, so 13 dimensioned dishes in the live library ("an ovenproof dish, about 18 x 23cm", "9-by-13-inch baking dish") came back with no family and no recipe baked in one could be fitted in Cayenne. A baking, ovenproof, gratin, casserole or pie dish now takes the family of its shape (rectangular traybake, square square, round round-cake, a pie dish tart), a rectangle is traybake and never square (F-298's 9 x 13 wobble), and a choice of sizes ("8x12 or 9x13-inch dish") takes the first. A dish sized only by capacity ("1.2 litre pie dish") still has no family: fitting by volume is a design of its own. Shared by REFINE and the pans backfill. After deploy, rerun the affected recipes with `backfill_pans.py --recipe-id … --force`.
+
+## [9.13.1] — 2026-10-14
+
+Bake types defined by how the item is made (Cayenne docs/superpowers/specs/2026-10-14-pan-families-savoury-pies-design.md, D29). No schema change; no Cayenne change needed.
+
+### 🐛 Fixed
+- The bake type rule gives each of the 13 types a definition by method (whisked foam, creamed or melted batter, yeast or chemical leavening, egg-set, crust or lid) instead of a few examples, and the model takes the first that fits, in a fixed order. `pie-savoury` now needs pastry, a suet crust or a mashed-potato lid: casseroles, gratins, lasagne and moussaka get no bake type, and neither does pastry on its own. A creamed cake is `butter-cake` even when it is called a sponge; yeast cakes are `bread-enriched`; fruit crumbles and cobblers are `pie-fruit`; cookies, granola and meringues get none. Shared by REFINE and the pans backfill.
+
+### ✨ Added
+- `scripts/probe_bake_types.py` and `tests/goldens/bake_types/cases.csv`: 56 of the owner's recipes at the boundaries, with the expected type. Read-only; reports matches and run-to-run agreement. On the first 50 cases, 9.13.0's rule matched 34 (46 stable over two runs). This rule matches 55 of all 56 in both runs, stable 56/56; the miss is Black Bun (a sweet filling in a hot-water crust, read as savoury). Over the whole library, two dry runs disagreed on 20 of 1,686 recipes.
+
+## [9.13.0] — 2026-10-14
+
+Stovetop vessels and savoury pies (Cayenne docs/superpowers/specs/2026-10-14-pan-families-savoury-pies-design.md, D25–D28). Needs Cayenne migration 20261014150000_pie_savoury: the database refuses `pie-savoury` until it is applied. Order: Cayenne live, then this deploy, then the pans backfill.
+
+### ✨ Added
+- Tin family `stovetop`: frying pans, skillets, sauté pans, woks, paella, omelette and pancake pans, griddles, saucepans, pots and lidded casserole pots, wherever the recipe uses them. A baking dish, even one called a casserole dish, is not stovetop. Cayenne recognises these vessels and never fits them.
+- Bake type `pie-savoury` (13 values): savoury fillings under pastry or a topping, including shepherd's, cottage and fish pie. A quiche stays `pie-custard`.
+
+## [9.12.1] — 2026-10-14
+
+### 🐛 Fixed
+- A tin the cook removed in Cayenne (a tombstone, `removed: true`) stays removed on regen: the cook's list is written back with it, and its `{{pan_NN|...}}` token is unwrapped to plain words. Pairs with Cayenne's F-291 PR.
+
+## [9.12.0] — 2026-10-14
+
+A recipe's tins, bake type and baking step, and the internal temperature it states, for Cayenne's pan-aware scaling (Cayenne docs/superpowers/specs/2026-10-13-pan-aware-scaling-design.md: parser contract, D9, D10, D21, D22, D24). Needs Cayenne migration 20261014090000_pan_aware_scaling (merged with Cayenne #287). Order: Cayenne #287 live, then this deploy, then the backfill.
+
+### ✨ Added
+- REFINE writes `pans` (each tin: id pan_NN, raw words, count, shape, family, dims_mm, capacity_ml, catalog_hint), `bake_type` (12 values) and `bake_step` (0-based) on a new ingest and on regen, and wraps the tin's words in the directions in `{{pan_NN|words}}`.
+- A `temp:` value may end `,core`: the food's internal temperature, the source's own doneness figure (`{{temp:93C,core|93°C}}`). Kept only on a °C/°F reading between 30 and 110 °C; a `,core` the model puts on an oven, fan or Gas Mark reading is removed and the token kept.
+- `recipeparser/core/pans.py`: the checks; a model slip costs the field, never the recipe. An unknown bake type drops its step too.
+- `scripts/backfill_pans.py`: gives existing recipes the same fields, pans-only. Run order: dry run with `--review pans-review.csv`, read the CSV (one line per tagged step with its new text, and one line per skipped recipe with its status), then `--live --record pans-before.csv`. `--restore pans-before.csv` puts the four columns back.
+
+### ⚠️ Operational
+- Regen reads the row's current `pans` first: when the cook has edited a tin (`edited: true`), their tins are written back unchanged, and a REFINE tin token is kept only if its id and words still name the cook's tin. Not guarded: a tin edit not yet synced when regen reads it can be overwritten.
+- Known limitation: removing a tin in Cayenne does not mark the remaining tins edited, so the next regen restores REFINE's tins. Needs a Cayenne-side follow-up.
+- The backfill never touches a recipe with a cook-edited tin, even with `--force`; `--force` unwraps the old tin tokens before placing new ones.
+- `scripts/backfill_direction_amounts.py` treats a recipe with a `pan_` token as already tagged, like one with a `temp:` token.
+- The Cayenne zip writer and the restore path carry `pans`, `bake_type` and `bake_step` (the writer used to fail on a recipe with a tin).
+- The backfill gives a recipe where it finds nothing the status `none-found`: not written, no record line. There is no "looked, found nothing" marker, so a rerun asks again; `--limit` is for trial runs.
+- `--restore` re-reads each row and skips one with an edited tin (`edited: true`), with a note.
+- Run order: `backfill_direction_amounts` before `backfill_pans`, because a legacy recipe whose only tokens are tin tokens counts as already tagged there.
+
+### 🧪 Tests
+- Unit tests for the grammar, the checks, REFINE, regen, the Gemini call and the backfill; the REFINE prompt and schema snapshots are updated.
+
+## [9.11.0] — 2026-10-13
+
+Oven temperatures are marked, so Cayenne can show them in the cook's unit (Cayenne oven temperatures design, D1-D15). Needs no migration. Order: the Cayenne client first, then this deploy, then the backfill.
+
+### ✨ Added
+- A `temp:` token in `tokenized_directions`: `{{temp:VALUE|words}}`, where VALUE is `[<n>C|<n>F|gas<mark>][,oven][,fan=<n>C|F]` (for example `180C,oven,fan=160C`, `gas4,oven`, `63C`). It has no `use` field and names no ingredient; `words` are the recipe's own words, unchanged.
+- REFINE's TEMPERATURES rule: the model wraps a temperature in a `temp:` token (a figure with its unit, a Gas Mark, a described oven such as "moderate oven"). `_check_temperatures` (D15) then unwraps, with a warning, any token whose value does not parse, whose words the directions do not write, or whose figured words carry neither the value's main nor fan number: a model slip costs the conversion, never the recipe.
+- `recipeparser/core/temperatures.py`: the deterministic wrap for the clear forms, including a conventional/fan pair in either order ("180°C (fan 160°C)", "160°C fan-forced (180°C conventional)").
+- `scripts/backfill_temperatures.py`: wraps the temperatures of existing recipes (rule first, Gemini only for bare figures and described ovens). Run order: dry run with `--review temperatures-review.csv`, read the CSV, then `--live --record temperatures-before.csv`.
+
+### ⚠️ Operational
+- `scripts/backfill_direction_amounts.py` now treats any recipe whose directions carry a `temp:` token as already tagged, with or without `--force`; before this release `--force` re-tagged a recipe from its plain text and would have stripped the temperature tokens.
+
+### 🧪 Tests
+- `test_temperatures.py`, `test_refine_temperatures.py` and `test_backfill_direction_amounts.py` cover the above.
+
+## [9.10.0] — 2026-10-12
+
+Ingredient section headings ("For the sauce:") are marked, not dropped (Cayenne ingredient headings, D1-D3). Needs no migration.
+
+### ✨ Added
+- REFINE gives every ingredient line exactly one entry and marks each with `kind`: `"heading"` for a line that names a part of the recipe and lists nothing to buy, `"ingredient"` otherwise. A heading has its words as `name`, the line as `fallback_string`, and no amount, unit or state.
+- The mentions prompt marks heading lines `(heading)` and forbids naming one as a mention.
+- A Cayenne-flavoured Paprika archive exported before 9.10.0 has no `kind`; it no longer restores instantly and goes through REFINE instead (new ids).
+
+## [9.9.1] — 2026-10-11
+
+*Apply to existing recipes* tags in the import's batches (Cayenne Fix Roadmap F-256). Needs no migration; the container restart deploys it.
+
+### 🐛 Fixed — a recategorise asked ten recipes a call
+- `RecatWorker` batched by 10 where the import's TAG stage asks five, after ten a call let a batch of vegetarian dishes carry two stock-based soups into `Vegetarian` (9.8.0's measurement). Its default is now `TAG_BATCH_SIZE`, and `scripts/retag_axis.py` reads the same constant instead of its own `5`, so one number governs every tagging call. A recategorise makes about twice the calls it did.
+- A recategorise job left running across this deploy resumes at five and estimates its failed-batch tally from the new size (the latent case Cayenne F-130 records).
+
+### 🧪 Tests
+- `test_recat_worker.py` and `test_retag_axis.py` hold both to `TAG_BATCH_SIZE`.
+
 ## [9.9.0] — 2026-10-08
 
 A retried import or share answers the first one (Cayenne Fix Roadmap F-200). Needs no migration; the container restart deploys it. Ship before the Cayenne half: the browser preflights the new header, and only this release allows it.
