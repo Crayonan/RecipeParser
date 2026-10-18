@@ -212,6 +212,7 @@ def test_refine_keeps_the_phase_headings_extraction_produced(golden_client):
     chunks = EpubReader().read(str(corpus_path("phases-bakers.epub")))
 
     phase_markers = []
+    phase_kinds: set = set()
     for chunk in chunks:
         text = chunk.text
         if gemini.needs_table_normalisation(text):
@@ -226,11 +227,14 @@ def test_refine_keeps_the_phase_headings_extraction_produced(golden_client):
             lines = [i.fallback_string for i in refined.structured_ingredients]
             lines += [d.text for d in refined.tokenized_directions]
             phase_markers = [line for line in lines if "phase" in line.lower()]
+            headings = [i for i in refined.structured_ingredients if "phase" in i.fallback_string.lower()]
+            phase_kinds = {i.kind for i in headings}
 
     assert phase_markers, (
         "the refined recipe kept no phase heading at all — extraction produced "
         "them and refinement dropped them"
     )
+    assert phase_kinds == {"heading"}, f"phase lines must be headings, got {phase_kinds}"
 
 
 def test_an_australian_recipe_is_detected_as_au_on_its_own_evidence(golden_client, monkeypatch):
@@ -299,3 +303,24 @@ def test_an_imperial_recipe_is_stored_as_written_and_detected_as_imperial(golden
         known = known_unit_words(path)
         unknown = [ing.unit for ing in refined.structured_ingredients if ing.unit and normalise(ing.unit) not in known]
         assert unknown == [], f"REFINE wrote unit words Cayenne does not parse: {unknown}"
+
+
+def test_refine_wraps_every_temperature_in_a_temp_token(golden_client, monkeypatch):
+    """oven-temperatures (oven temperatures design D3-D5): each temperature is one token, the value
+    is what the writer meant, the core temperature is not an oven setting, and no word changes."""
+    from recipeparser.core.fat_tokens import TOKEN_RE, is_temp_id, parse_temp_value, strip_fat_tokens
+
+    fixture = "oven-temperatures.paprikarecipes"
+    client = golden_client(fixture)
+    chunks = _chunks_for(fixture, monkeypatch)
+    raws = extract(chunk_text=chunks[0].text, client=client,
+                   plain_text_mode=chunks[0].input_type == InputType.PAPRIKA_LEGACY).recipes
+    refined = refine(raw=raws[0], client=client)
+
+    temps = {m.group(2): parse_temp_value(m.group(1)[len("temp:"):])
+             for d in refined.tokenized_directions for m in TOKEN_RE.finditer(d.text) if is_temp_id(m.group(1))}
+    assert temps["220°C/200°C fan/gas mark 7"] == (("C", 220.0), ("C", 200.0), True, False)
+    assert temps["180"] == (("C", 180.0), None, True, False)
+    assert temps.get("moderate oven") == (("C", 180.0), None, True, False)
+    assert temps["63°C"] == (("C", 63.0), None, False, False)
+    assert [strip_fat_tokens(d.text) for d in refined.tokenized_directions] == raws[0].directions

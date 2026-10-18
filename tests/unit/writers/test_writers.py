@@ -52,7 +52,7 @@ def _make_recipe(
     can verify stripping behaviour.
     """
     ing = StructuredIngredient(
-        id="ing_01",
+        id="ing_01", kind="ingredient",
         amount=1.5,
         unit="cups",
         name="all-purpose flour",
@@ -614,7 +614,7 @@ def test_image_store_stores_a_large_picture_scaled_as_a_jpeg():
 def test_an_unquantified_ingredient_serialises_as_null():
     """Spec 4.8: 'to taste' must not be indistinguishable from a real zero."""
     ingredient = StructuredIngredient(
-        id="ing_01",
+        id="ing_01", kind="ingredient",
         amount=None,
         unit=None,
         name="Kosher salt",
@@ -808,3 +808,18 @@ def test_a_cayenne_archive_round_trips_every_new_field(tmp_path: Path):
     assert chunk.pre_parsed.nutritional_info == "520 kcal"
     assert chunk.pre_parsed.description == "A cold-weather pie."
     assert chunk.pre_parsed.difficulty == "Moderate"
+
+
+def test_the_cayenne_writer_dumps_the_tins_as_dicts(tmp_path: Path):
+    from recipeparser.models import RecipePan
+
+    tin = RecipePan(id="pan_01", raw="20cm round tin", shape="round", family="round-cake")
+    recipe = _make_recipe("Cake").model_copy(update={"pans": [tin], "bake_type": "sponge", "bake_step": 0})
+    out = tmp_path / "export.paprikarecipes"
+    CayenneZipWriter(out).write([recipe])
+
+    meta = _read_one_entry(out)["_cayenne_meta"]
+
+    assert isinstance(meta["pans"], list) and isinstance(meta["pans"][0], dict)
+    assert meta["pans"][0]["id"] == "pan_01" and meta["pans"][0]["raw"] == "20cm round tin"
+    assert meta["bake_type"] == "sponge" and meta["bake_step"] == 0

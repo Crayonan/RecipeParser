@@ -1,11 +1,14 @@
 {
   "recipes": [
     {
+      "bake_step": null,
+      "bake_type": null,
       "base_servings": 12,
       "categories": [
         "British",
         "Dessert"
       ],
+      "category_paths": [],
       "cook_max_minutes": 40,
       "cook_min_minutes": 40,
       "cook_note": null,
@@ -30,6 +33,7 @@
           "Dessert"
         ]
       },
+      "image_source": null,
       "image_url": null,
       "ingredient_lines": [
         "14 tablespoons/200g butter",
@@ -37,8 +41,10 @@
         "2 cups/250g plain flour",
         "1/4 teaspoon/1.5g fine salt"
       ],
+      "is_favourite": null,
       "notes": null,
       "nutritional_info": null,
+      "pans": [],
       "prep_max_minutes": 20,
       "prep_min_minutes": 20,
       "prep_note": null,
@@ -47,14 +53,17 @@
       "servings_max": 12,
       "servings_min": 12,
       "servings_note": null,
+      "servings_source": "stated",
       "source": "Dual Units",
       "source_author": null,
       "source_key": "dual units",
       "source_kind": "book",
       "source_title": "Dual Units",
+      "source_uom_system": null,
       "source_uom_system_detected": null,
       "source_uom_system_evidence": null,
       "source_url": null,
+      "stale": false,
       "structured_ingredients": [
         {
           "amount": 14.0,
@@ -63,6 +72,7 @@
           "fallback_string": "14 tablespoons/200g butter",
           "id": "ing_01",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "butter",
           "state": null,
@@ -75,6 +85,7 @@
           "fallback_string": "1/2 cup/100g caster sugar",
           "id": "ing_02",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "caster sugar",
           "state": null,
@@ -87,6 +98,7 @@
           "fallback_string": "2 cups/250g plain flour",
           "id": "ing_03",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "plain flour",
           "state": null,
@@ -99,6 +111,7 @@
           "fallback_string": "1/4 teaspoon/1.5g fine salt",
           "id": "ing_04",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "fine salt",
           "state": null,
@@ -126,12 +139,15 @@
       ]
     },
     {
+      "bake_step": null,
+      "bake_type": null,
       "base_servings": 8,
       "categories": [
         "British",
         "Breakfast",
         "Bread"
       ],
+      "category_paths": [],
       "cook_max_minutes": 14,
       "cook_min_minutes": 14,
       "cook_note": null,
@@ -157,6 +173,7 @@
           "Bread"
         ]
       },
+      "image_source": null,
       "image_url": null,
       "ingredient_lines": [
         "2 cups/250g plain flour",
@@ -165,8 +182,10 @@
         "5 tablespoons/70g cold butter, cubed",
         "3/4 cup/180ml buttermilk"
       ],
+      "is_favourite": null,
       "notes": null,
       "nutritional_info": null,
+      "pans": [],
       "prep_max_minutes": 15,
       "prep_min_minutes": 15,
       "prep_note": null,
@@ -175,14 +194,17 @@
       "servings_max": 8,
       "servings_min": 8,
       "servings_note": null,
+      "servings_source": "stated",
       "source": "Dual Units",
       "source_author": null,
       "source_key": "dual units",
       "source_kind": "book",
       "source_title": "Dual Units",
+      "source_uom_system": null,
       "source_uom_system_detected": null,
       "source_uom_system_evidence": null,
       "source_url": null,
+      "stale": false,
       "structured_ingredients": [
         {
           "amount": 2.0,
@@ -191,6 +213,7 @@
           "fallback_string": "2 cups/250g plain flour",
           "id": "ing_01",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "plain flour",
           "state": null,
@@ -203,6 +226,7 @@
           "fallback_string": "1 tablespoon/12g baking powder",
           "id": "ing_02",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "baking powder",
           "state": null,
@@ -215,6 +239,7 @@
           "fallback_string": "1/2 teaspoon/3g fine salt",
           "id": "ing_03",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "fine salt",
           "state": null,
@@ -227,6 +252,7 @@
           "fallback_string": "5 tablespoons/70g cold butter, cubed",
           "id": "ing_04",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "cold butter",
           "state": null,
@@ -239,6 +265,7 @@
           "fallback_string": "3/4 cup/180ml buttermilk",
           "id": "ing_05",
           "is_ai_converted": false,
+          "kind": "ingredient",
           "line_index": null,
           "name": "buttermilk",
           "state": null,

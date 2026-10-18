@@ -1,5 +1,5 @@
 """Pydantic models for structured Gemini output."""
-from typing import Dict, List, Literal, NamedTuple, Optional
+from typing import Dict, List, Literal, NamedTuple, Optional, get_args
 
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
@@ -141,6 +141,13 @@ class TocRecipeClassification(BaseModel):
 
 class StructuredIngredient(BaseModel):
     id: str = Field(description="Unique ID for cross-linking, e.g., \"ing_01\"")
+    kind: Literal["ingredient", "heading"] = Field(
+        description=(
+            "\"heading\" for a line that names a part of the recipe and lists nothing to buy "
+            "(\"For the sauce:\", \"PUDDING\", \"To serve:\"); \"ingredient\" for every other line, "
+            "including a food with no amount (\"Butter for greasing\")."
+        ),
+    )
     amount: Optional[float] = Field(
         default=None,
         description="Numeric quantity, e.g. 1.5. null when the source states no amount ('salt to taste').",
@@ -170,8 +177,8 @@ class StructuredIngredient(BaseModel):
         default=None,
         description=(
             "0-based index of the raw ingredient line this entry was parsed from. "
-            "Every ingredient line yields exactly one entry; section-header lines "
-            "yield none. null only when the entry is not tied to a single line."
+            "Every line, heading or ingredient, yields exactly one entry. "
+            "null only when the entry is not tied to a single line."
         ),
     )
 
@@ -181,7 +188,8 @@ class TokenizedDirection(BaseModel):
     text: str = Field(
         description=(
             "Direction text with Fat Tokens {{id|words|use}}: words exactly as written, use one of "
-            "all, rest, none, or an amount such as '0.5 cup'."
+            "all, rest, none, or an amount such as '0.5 cup'; and temperature tokens "
+            "{{temp:VALUE|words}}, VALUE such as '180C,oven,fan=160C', '350F' or 'gas4'."
         )
     )
 
@@ -203,10 +211,108 @@ class DirectionMentions(BaseModel):
     mentions: List[DirectionMention] = Field(default_factory=list)
 
 
+class TemperatureMention(BaseModel):
+    """One temperature in a direction step, as the temperature backfill reports it (Cayenne oven temperatures)."""
+    step: int = Field(description="1-based number of the step the temperature is in.")
+    quote: str = Field(description="The words to wrap, copied exactly from that step.")
+    context: str = Field(default="", description="The quote with about five words around it, copied exactly from the step.")
+    value: str = Field(description="What the writer meant: '180C,oven', '350F', 'gas4', '180C,oven,fan=160C'.")
+
+
+class TemperatureMentions(BaseModel):
+    """The temperature backfill's whole answer for one recipe."""
+    mentions: List[TemperatureMention] = Field(default_factory=list)
+
+
+class PanDims(BaseModel):
+    """A tin's inside size in millimetres."""
+    d: Optional[float] = Field(default=None, description="Diameter, for a round tin.")
+    w: Optional[float] = Field(default=None, description="Width, for a rectangle or loaf.")
+    l: Optional[float] = Field(default=None, description="Length, for a rectangle or loaf.")  # noqa: E741
+    depth: Optional[float] = Field(default=None, description="Depth, only if the recipe states it.")
+
+
+# Shapes, families and bake types are plain strings, not Literals: a word outside the list must
+# not fail validation and cost the recipe (the source_uom_system_detected precedent). core/pans.py
+# enforces the vocabulary.
+class RecipePan(BaseModel):
+    """One kind of tin a recipe bakes in."""
+    id: str = Field(description="pan_01, pan_02, \u2026 in order of first mention.")
+    raw: str = Field(description="The recipe's words naming the tin(s), copied exactly.")
+    # No lower bound: validation must never fail on a count.
+    count: int = Field(
+        default=1,
+        description="How many of this tin the recipe uses (two 20 cm tins \u2192 2).",
+    )
+    shape: Optional[str] = Field(
+        default=None, description="round, square, rect, loaf, ring, flat-round, sheet; null if unknown."
+    )
+    family: Optional[str] = Field(
+        default=None, description="round-cake, square, traybake, sheet, loaf, ring, tart, pizza, stovetop; null if unknown."
+    )
+    dims_mm: PanDims = Field(
+        default_factory=PanDims,
+        description=(
+            "Inside size in millimetres (inches \u00d7 25.4): d for a round, l and w for a rectangle "
+            "or loaf, depth only if the recipe states it."
+        ),
+    )
+    capacity_ml: Optional[float] = Field(
+        default=None,
+        description="Only when the recipe names the tin by volume ('a 1.5 litre tin', 'a 10-cup Bundt').",
+    )
+    catalog_hint: Optional[str] = Field(
+        default=None, description="Only for the named tins listed in the prompt; otherwise null."
+    )
+    # Set by a person editing the tin; the model is never asked for it (stripped from its schema).
+    edited: bool = False
+    # Set by a person removing the tin, kept so a restore round-trips it; stripped from the model's schema too.
+    removed: bool = False
+
+
+_BAKE_TYPE_DESC = (
+    "What the recipe bakes, one word from the prompt's list of 13 bake types; null when nothing bakes."
+)
+_BAKE_STEP_DESC = (
+    "0-based index into tokenized_directions of the step that bakes; null when nothing bakes."
+)
+
+
+class PanMention(BaseModel):
+    """A tin named in a direction step."""
+    step: int = Field(description="1-based number of the step the tin is named in.")
+    quote: str = Field(description="The words naming the tin, copied exactly from that step.")
+    context: str = Field(
+        default="", description="The quote with about five words around it, copied exactly from the step."
+    )
+    pan_id: str = Field(description="The id of the pan in pans this refers to.")
+
+
+class CoreMention(BaseModel):
+    """An internal temperature named in a direction step."""
+    step: int = Field(description="1-based number of the step the temperature is in.")
+    quote: str = Field(description="The words of the internal temperature, copied exactly.")
+
+
+class PanAnswer(BaseModel):
+    """The pan pass's whole answer for one recipe."""
+    pans: List[RecipePan] = Field(default_factory=list)
+    bake_type: Optional[str] = Field(default=None, description=_BAKE_TYPE_DESC)
+    bake_step: Optional[int] = Field(default=None, description=_BAKE_STEP_DESC)
+    mentions: List[PanMention] = Field(default_factory=list)
+    core: List[CoreMention] = Field(default_factory=list)
+
+
 class CayenneRefinement(BaseModel):
     """Internal refinement pass output."""
     title: str
-    base_servings: Optional[int]
+    base_servings: Optional[int] = Field(
+        description=(
+            "How many people one batch of this recipe serves. When the recipe states servings, that "
+            "number; otherwise your best estimate for a home cook from the whole recipe. Never the "
+            "number of cakes, loaves, tins, pans or jars it makes."
+        ),
+    )
     structured_ingredients: List[StructuredIngredient]
     tokenized_directions: List[TokenizedDirection]
     grid_categories: Dict[str, List[str]] = Field(
@@ -230,6 +336,11 @@ class CayenneRefinement(BaseModel):
         default=None,
         description="The words that judgement rests on, quoted exactly from the recipe, or the source host exactly as given.",
     )
+    pans: List[RecipePan] = Field(
+        default_factory=list, description="The tins the recipe bakes in; [] when none."
+    )
+    bake_type: Optional[str] = Field(default=None, description=_BAKE_TYPE_DESC)
+    bake_step: Optional[int] = Field(default=None, description=_BAKE_STEP_DESC)
     # The refiner's own review of the recipe it just structured (web app "Improvements"). Kept on
     # the refinement and carried to IngestResponse privately, so no archive or table changes shape.
     review_notes: List["ReviewNote"] = Field(
@@ -262,12 +373,21 @@ class ReviewNote(BaseModel):
 CayenneRefinement.model_rebuild()
 
 
+# Where a recipe's base_servings came from (scale-sheet redesign D44).
+ServingsSource = Literal["stated", "counted", "tin", "estimated"]
+_SERVINGS_SOURCES = frozenset(get_args(ServingsSource))
+
+
 class CayenneRecipe(BaseModel):
     """Canonical recipe shape for Project Cayenne."""
     title: str
     prep_time: Optional[str] = None
     cook_time: Optional[str] = None
     base_servings: Optional[int] = None
+    # Where base_servings came from (scale-sheet redesign D44): the recipe stated it, counted
+    # its items, the tin table, or the model's estimate; None when unknown. Written at insert,
+    # never by the regen worker.
+    servings_source: Optional[str] = None
     source_url: Optional[str] = None
     image_url: Optional[str] = None  # Supabase Storage public URL; None when no photo available
     source: Optional[str] = Field(
@@ -298,6 +418,31 @@ class CayenneRecipe(BaseModel):
     # What REFINE detected (verbatim-ingestion D5), written at insert and by the regen worker.
     source_uom_system_detected: Optional[str] = None
     source_uom_system_evidence: Optional[str] = None
+    pans: List[RecipePan] = Field(default_factory=list)
+    bake_type: Optional[str] = None
+    bake_step: Optional[int] = None
+    # _cayenne_meta version 2 (Paprika export): read back by a restore, never asked of the model.
+    is_favourite: Optional[bool] = None
+    category_paths: List[List[str]] = Field(default_factory=list)
+    source_uom_system: Optional[str] = None
+    image_source: Optional[str] = None
+    stale: bool = False
+
+    @field_validator("servings_source", mode="before")
+    @classmethod
+    def _unknown_servings_source_is_none(cls, v):
+        return v if isinstance(v, str) and v in _SERVINGS_SOURCES else None
+
+    @field_validator("category_paths", mode="before")
+    @classmethod
+    def _null_paths_are_empty(cls, v):
+        return [] if v is None else v
+
+    @field_validator("stale", mode="before")
+    @classmethod
+    def _null_stale_is_false(cls, v):
+        return False if v is None else v
+
     # Raw, user-owned body (spec 3.2). Empty lists on legacy objects; the writer
     # and regen worker derive them from the structured data when empty.
     ingredient_lines: List[str] = Field(default_factory=list)

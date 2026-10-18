@@ -4,22 +4,29 @@ import logging
 import pytest
 
 from recipeparser.core.fat_tokens import (
+    TempValue,
     Use,
     check_mentions,
+    is_pan_id,
     is_quantity,
+    is_special_id,
     is_tagged,
+    is_temp_id,
+    pan_token,
+    parse_temp_value,
     parse_use,
     splice_mentions,
     strip_fat_tokens,
+    temp_token,
 )
 from recipeparser.models import DirectionMention, StructuredIngredient, TokenizedDirection
 
-FLOUR = StructuredIngredient(id="ing_02", amount=0.75, unit="cup", name="all-purpose flour",
+FLOUR = StructuredIngredient(id="ing_02", kind="ingredient", amount=0.75, unit="cup", name="all-purpose flour",
                              fallback_string="3/4 cup (90 g) all-purpose flour",
                              converted_amount=90, converted_unit="g")
-RICOTTA = StructuredIngredient(id="ing_01", amount=425, unit="g", name="ricotta cheese, preferably whole milk",
+RICOTTA = StructuredIngredient(id="ing_01", kind="ingredient", amount=425, unit="g", name="ricotta cheese, preferably whole milk",
                                fallback_string="425 g ricotta cheese, preferably whole milk")
-SALT = StructuredIngredient(id="ing_03", name="Kosher salt", fallback_string="Kosher salt")
+SALT = StructuredIngredient(id="ing_03", kind="ingredient", name="Kosher salt", fallback_string="Kosher salt")
 GNOCCHI = [RICOTTA, FLOUR, SALT]
 GNOCCHI_STEPS = [
     "Drain the ricotta overnight.",
@@ -170,16 +177,16 @@ def test_refine_demotes_and_logs(caplog):
 # The first live sample (2026-10-02, 20 recipes) showed the model putting amounts on names, the whole
 # amount at every mention, and mentions out of order. Each case below is from that sample.
 class TestTheFirstSample:
-    BUTTER = StructuredIngredient(id="ing_01", amount=175, unit="g", name="butter", fallback_string="175 g butter")
-    SUGAR = StructuredIngredient(id="ing_02", amount=50, unit="g", name="confectioners' sugar",
+    BUTTER = StructuredIngredient(id="ing_01", kind="ingredient", amount=175, unit="g", name="butter", fallback_string="175 g butter")
+    SUGAR = StructuredIngredient(id="ing_02", kind="ingredient", amount=50, unit="g", name="confectioners' sugar",
                                  fallback_string="50 g confectioners' sugar")
-    PEEL = StructuredIngredient(id="ing_05", amount=1, name="lemon peel", fallback_string="grated peel of 1 lemon")
-    OIL = StructuredIngredient(id="ing_09", amount=2, unit="tablespoons", name="canola oil",
+    PEEL = StructuredIngredient(id="ing_05", kind="ingredient", amount=1, name="lemon peel", fallback_string="grated peel of 1 lemon")
+    OIL = StructuredIngredient(id="ing_09", kind="ingredient", amount=2, unit="tablespoons", name="canola oil",
                                fallback_string="2 tablespoons canola oil")
-    PEAS = StructuredIngredient(id="ing_10", amount=1, unit="cup", name="peas", fallback_string="1 cup peas")
-    BUTTERMILK = StructuredIngredient(id="ing_11", amount=400, unit="ml", name="buttermilk",
+    PEAS = StructuredIngredient(id="ing_10", kind="ingredient", amount=1, unit="cup", name="peas", fallback_string="1 cup peas")
+    BUTTERMILK = StructuredIngredient(id="ing_11", kind="ingredient", amount=400, unit="ml", name="buttermilk",
                                       fallback_string="400 ml buttermilk")
-    RICE = StructuredIngredient(id="ing_12", amount=1.5, unit="cups", name="rice", fallback_string="1 1/2 cups rice")
+    RICE = StructuredIngredient(id="ing_12", kind="ingredient", amount=1.5, unit="cups", name="rice", fallback_string="1 1/2 cups rice")
     ALL = [BUTTER, SUGAR, PEEL, OIL, PEAS, BUTTERMILK, RICE]
 
     def _check(self, *texts):
@@ -260,7 +267,7 @@ class TestTheFirstSample:
 
 # The second live sample (after 9.5.1): the model wrapped a quantity and the name together.
 class TestTheSecondSample:
-    PEAS = StructuredIngredient(id="ing_01", amount=1, unit="cup", name="peas",
+    PEAS = StructuredIngredient(id="ing_01", kind="ingredient", amount=1, unit="cup", name="peas",
                                 fallback_string="1 cup freshly shelled (or frozen) peas")
 
     def test_an_amount_on_a_quantity_and_the_name_together_becomes_none(self):
@@ -285,9 +292,9 @@ class TestTheSecondSample:
 
 # The third live sample (after 9.6.1): a whole-amount token right after a quantity the text writes.
 class TestTheThirdSample:
-    BANANAS = StructuredIngredient(id="ing_04", amount=4, name="bananas", fallback_string="4 ripe bananas")
-    WHITES = StructuredIngredient(id="ing_09", amount=2, name="eggs", fallback_string="2 eggs")
-    FLOUR = StructuredIngredient(id="ing_01", amount=2, unit="cups", name="flour", fallback_string="2 cups flour")
+    BANANAS = StructuredIngredient(id="ing_04", kind="ingredient", amount=4, name="bananas", fallback_string="4 ripe bananas")
+    WHITES = StructuredIngredient(id="ing_09", kind="ingredient", amount=2, name="eggs", fallback_string="2 eggs")
+    FLOUR = StructuredIngredient(id="ing_01", kind="ingredient", amount=2, unit="cups", name="flour", fallback_string="2 cups flour")
 
     def _check(self, *texts):
         return [d.text for d in check_mentions([self.BANANAS, self.WHITES, self.FLOUR], _d(*texts))[0]]
@@ -309,3 +316,75 @@ class TestTheThirdSample:
     ])
     def test_a_number_in_an_earlier_clause_does_not_count(self, before):
         assert self._check(before + "{{ing_01|flour|all}}.") == [before + "{{ing_01|flour|all}}."]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("180C", TempValue(("C", 180.0), None, False)),
+    ("350F,oven", TempValue(("F", 350.0), None, True)),
+    ("gas4", TempValue(("gas", 4.0), None, True)),
+    ("gas0.25", TempValue(("gas", 0.25), None, True)),
+    ("180C,oven,fan=160C", TempValue(("C", 180.0), ("C", 160.0), True)),
+    ("180C,fan=160C", TempValue(("C", 180.0), ("C", 160.0), True)),
+    ("fan=160C", TempValue(None, ("C", 160.0), True)),
+    ("-18C", TempValue(("C", -18.0), None, False)),
+])
+def test_parse_temp_value_reads_the_grammar(raw, expected):
+    assert parse_temp_value(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "", "180", "180K", "gas10", "gas0.75", "oven", "oven,180C", "180C,fan=160C,oven", "400C", "-50C", "700F",
+])
+def test_parse_temp_value_refuses_what_the_client_refuses(raw):
+    assert parse_temp_value(raw) is None
+
+
+def test_temp_token_and_is_temp_id():
+    assert temp_token("180C,oven", "180°C") == "{{temp:180C,oven|180°C}}"
+    assert is_temp_id("temp:180C") and not is_temp_id("ing_01")
+
+
+def test_pan_ids_are_special_and_never_ingredients():
+    assert is_pan_id("pan_01") and is_special_id("pan_01")
+    assert is_special_id("temp:180C,oven")
+    assert not is_pan_id("ing_pan_01") and not is_special_id("ing_01")
+    assert pan_token("pan_01", "two 20cm tins") == "{{pan_01|two 20cm tins}}"
+
+
+def test_core_flag_parses_after_a_degree_reading_only():
+    v = parse_temp_value("93C,core")
+    assert v is not None and v.core and not v.oven and v.main == ("C", 93.0)
+    assert parse_temp_value("205F,core").core
+    assert parse_temp_value("180C,oven").core is False
+    for bad in ("gas4,core", "93C,core,oven", "93C,oven,core", "93C,core,fan=80C"):
+        assert parse_temp_value(bad) is None, bad
+
+
+def test_is_tagged_ignores_pan_tokens():
+    steps = [TokenizedDirection(step=1, text="Grease {{pan_01|two tins}} and add {{ing_01|flour|all}}")]
+    assert is_tagged(steps)
+    only_pan = [TokenizedDirection(step=1, text="Grease {{pan_01|two tins}}")]
+    assert not is_tagged(only_pan)
+
+
+# Spec Acceptance: exports and regeneration show the writer's words (they all strip with this).
+def test_strip_fat_tokens_gives_a_temperature_back_as_its_words():
+    assert strip_fat_tokens("Bake at {{temp:180C,oven,fan=160C|180°C/160°C fan}}.") == "Bake at 180°C/160°C fan."
+
+
+# Review focus 3: a temperature token says nothing about whether the ingredient mentions carry a use.
+def test_is_tagged_ignores_temperature_tokens():
+    tagged = _d("Mix {{ing_01|flour|all}}; bake at {{temp:180C,oven|180°C}}.")
+    legacy = _d("Mix {{ing_01|flour}}; bake at {{temp:180C,oven|180°C}}.")
+    only_temps = _d("Bake at {{temp:180C,oven|180°C}}.")
+    assert is_tagged(tagged) is True
+    assert is_tagged(legacy) is False
+    assert is_tagged(only_temps) is False
+
+
+def test_check_mentions_leaves_temperature_tokens_as_they_are():
+    flour = StructuredIngredient(id="ing_01", kind="ingredient", amount=1, unit="cup", name="flour", fallback_string="1 cup flour")
+    text = "Mix {{ing_01|flour|all}}; bake at {{temp:180C,oven|180°C}}."
+    out, changes = check_mentions([flour], _d(text))
+    assert out[0].text == text
+    assert changes == []

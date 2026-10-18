@@ -10,7 +10,7 @@ import json
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Type, TypeVar
 
 from google.genai import errors as genai_errors
 from pydantic import BaseModel, Field, ValidationError
@@ -28,8 +28,19 @@ from recipeparser.config import (
     PARSE_RETRY_DELAY_SECS,
     THINKING_LEVEL,
 )
+from recipeparser import usage
+from recipeparser.core.pans import BAKE_TYPES, HINT_KEYS, PAN_FAMILIES, PAN_SHAPES
 from recipeparser.exceptions import ExtractionParseError
-from recipeparser.models import CayenneRefinement, DirectionMention, DirectionMentions, RecipeList, StructuredIngredient
+from recipeparser.models import (
+    CayenneRefinement,
+    DirectionMention,
+    DirectionMentions,
+    PanAnswer,
+    RecipeList,
+    StructuredIngredient,
+    TemperatureMention,
+    TemperatureMentions,
+)
 
 if TYPE_CHECKING:
     from recipeparser.core.rate_limiter import GlobalRateLimiter
@@ -62,6 +73,29 @@ def _schema_for_gemini(schema_class: Type[BaseModel]) -> dict:
     """
     raw = schema_class.model_json_schema()
     return _strip_additional_properties(raw)
+
+
+_CLIENT_FIELDS = frozenset({"edited", "removed"})
+
+
+def schema_without_client_fields(schema: dict) -> dict:
+    """Return *schema* without any ``edited`` or ``removed`` property: RecipePan.edited and
+    .removed are set by a person editing a tin, never by the model, so they stay out of every
+    schema the model is held to."""
+    def strip(obj):
+        if isinstance(obj, dict):
+            return {
+                k: (
+                    {n: strip(v) for n, v in val.items() if n not in _CLIENT_FIELDS}
+                    if k == "properties" and isinstance(val, dict)
+                    else strip(val)
+                )
+                for k, val in obj.items()
+            }
+        if isinstance(obj, list):
+            return [strip(i) for i in obj]
+        return obj
+    return strip(schema)
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -172,24 +206,26 @@ def _finalize_config(config: dict) -> dict:
     }
 
 
-def _log_usage_metadata(response: object, what: str) -> None:
-    """Best-effort log of the token accounting a Gemini reply carries.
+def _log_usage_metadata(response: object, what: str, model: str) -> None:
+    """Best-effort log of the token accounting a Gemini reply carries, and its record.
 
     Nothing in this module previously looked at ``usage_metadata``, so every
     cost estimate for the ingestion pipeline was a guess from prompt length
     alone. This puts the real per-call numbers — including any thinking
-    tokens, when THINKING_LEVEL allows them — into the log instead.
+    tokens, when THINKING_LEVEL allows them — into the log, and into ai_usage
+    under the caller's attribution (recipeparser/usage.py, AI caps D8).
     """
-    usage = getattr(response, "usage_metadata", None)
-    if usage is None:
+    usage_meta = getattr(response, "usage_metadata", None)
+    usage.record(what, model, usage_meta)
+    if usage_meta is None:
         return
     log.info(
         "%s usage: prompt=%s candidates=%s thoughts=%s total=%s",
         what,
-        getattr(usage, "prompt_token_count", None),
-        getattr(usage, "candidates_token_count", None),
-        getattr(usage, "thoughts_token_count", None),
-        getattr(usage, "total_token_count", None),
+        getattr(usage_meta, "prompt_token_count", None),
+        getattr(usage_meta, "candidates_token_count", None),
+        getattr(usage_meta, "thoughts_token_count", None),
+        getattr(usage_meta, "total_token_count", None),
     )
 
 
@@ -229,7 +265,7 @@ def _call_with_retry(
             contents=contents,
             config=_finalize_config(config),
         )
-        _log_usage_metadata(response, what)
+        _log_usage_metadata(response, what, model)
         return response
 
     return _with_backoff(_once, limiter=limiter, max_retries=max_retries)
@@ -343,7 +379,7 @@ def verify_connectivity(client) -> bool:
             contents="Reply with the single word OK.",
             config=_finalize_config({"max_output_tokens": 5}),
         )
-        _log_usage_metadata(response, "Connectivity check")
+        _log_usage_metadata(response, "Connectivity check", GEMINI_MODEL)
         log.info("Gemini connectivity check passed (response: %s).", response.text.strip())
         return True
     except Exception as e:
@@ -381,7 +417,7 @@ def get_embeddings(
                 http_options={"timeout": _HTTP_TIMEOUT_MS},
             ),
         )
-        _log_usage_metadata(response, "Embedding")
+        _log_usage_metadata(response, "Embedding", GEMINI_EMBEDDING_MODEL)
         return response
 
     try:
@@ -758,6 +794,83 @@ _MENTION_USES = """   - Say how much of the ingredient each mention uses, as "us
    - Wrap only the ingredient's words, never "the", "your" or "of": "the flour" -> the words are "flour"."""
 
 
+# Rule 5 of the REFINE prompt, templates over core.pans' vocabularies so they cannot drift. The
+# shared part (_TINS_VOCAB = sizes + bake type) also builds the pans-only prompt; the token and
+# bake_step bullets are REFINE's own, because they speak of tokenized_directions. Literal braces
+# are doubled for str.format.
+_TINS_SIZES = """\
+   - "pans": every baking tin, pan, tray or dish the recipe names with a size, in order of first
+     mention, ids pan_01, pan_02, ... One entry per size: "two 20cm sandwich tins" is ONE entry with
+     "count": 2. "raw" is the recipe's words, copied exactly.
+   - "shape": one of {shapes}. "family": one of {families}.
+   - "family" stovetop: a frying pan, skillet, sauté pan, wok, paella pan, omelette or pancake pan,
+     griddle, saucepan, pot or lidded casserole pot such as a Dutch oven, whether the recipe uses it
+     on the hob or in the oven; a baking dish, even one called a casserole dish, is not stovetop.
+   - A baking, ovenproof, gratin, casserole or pie dish takes the family of its shape: rectangular
+     traybake, square square, round round-cake, a pie dish tart. When the recipe offers a choice
+     ("8-inch square or round baking dish", "8x12 or 9x13-inch dish"), use the first size and shape it names.
+     A rectangle is traybake, never square: square only when its sides are equal (a 9 x 13-inch dish or
+     pan is traybake).
+   - "dims_mm": inside size in MILLIMETRES (inches x 25.4): "d" for a round, "l" and "w" for a
+     rectangle, square or loaf; "depth" only when the recipe states it. Never guess a size.
+   - "capacity_ml" only when the recipe names the tin by volume ("a 1.5 litre tin", "a 10-cup Bundt").
+   - "catalog_hint" only for a tin the recipe names WITHOUT a size, from this list, else null:
+     {hints}.
+   - A tin with no size and none of those names ("a cake tin", "a baking dish") is not listed."""
+_TINS_BAKE = """\
+   - "bake_type": one of {bake_types}, or null. Decide by how the item is made, not by its name, and
+     take the first that fits, in this order:
+     1. pizza: a yeast-dough base baked flat under its toppings.
+     2. cheesecake: a filling that is mostly soft cheese (cream cheese, ricotta, quark) set with eggs.
+     3. a pie or tart, never a recipe for pastry or dough alone: a pastry or crumb crust holds the
+        filling, or a lid of pastry, a suet crust or mashed potato covers it. A sweet filling is never
+        pie-savoury, whatever the crust (hot water, suet or shortcrust).
+        pie-custard: the filling is mostly egg with milk or cream and sets as it bakes (custard tart,
+        quiche, pumpkin and sweet potato pie, lemon meringue). pie-nut: a sugar-syrup, nut or frangipane
+        filling (pecan pie, treacle tart, butter tart, Bakewell tart). pie-fruit: a sweet fruit filling
+        (apple pie, mince pies, tarte tatin, sweet fruit galettes), sweet suet puddings and fruit-filled
+        pastries (Sussex pond pudding, Eccles cakes, black bun), and fruit baked under a crumble, crisp or
+        cobbler topping with no crust. pie-savoury: a savoury filling in or under pastry, a suet crust or
+        mashed potato (meat and pot pies, pasties, empanadas, sausage rolls, beef Wellington, steak and
+        kidney pudding, savoury tarts and galettes), and fish or meat under a mashed-potato lid (shepherd's,
+        cottage and fish pie): a mashed-potato lid is not a topping. Never pie-savoury: a dish topped with cheese, sauce or breadcrumbs (lasagne,
+        moussaka, enchiladas, gratins, aubergine parmigiana), or anything sweet.
+     4. custard: an egg-set liquid baked with no crust (baked custard, crème caramel, crème brûlée,
+        bread and butter pudding, clafoutis, baked rice pudding).
+     5. bread-enriched / bread-lean: risen with yeast or a sourdough starter. bread-enriched when the
+        dough has egg, or more than a spoonful of butter, oil, sugar or milk (brioche, challah, buns,
+        rolls, babka, stollen, yeast cakes); otherwise bread-lean (baguette, sourdough, ciabatta, pitta).
+     6. quick-bread: a bread, loaf, muffin or scone raised with baking powder or soda (banana bread,
+        muffins, scones, soda bread, cornbread), and popovers, Yorkshire puddings and toad in the hole.
+     7. butter-cake: a cake raised with baking powder or soda, its fat creamed, melted or oil (layer,
+        pound, Bundt, loaf, fruit, carrot, gingerbread and upside-down cakes, cupcakes, steamed sponge
+        puddings). A creamed cake
+        is butter-cake even when it is called a sponge (Victoria sponge).
+     8. sponge: a cake risen by eggs whisked to a foam, with little or no fat (génoise, Swiss roll,
+        fatless sponge, angel food, chiffon).
+     9. bar: a batter or dough baked in one pan and cut into pieces (brownies, blondies, flapjacks,
+        shortbread slices).
+     null: anything else, including roast meat, casseroles, cookies baked as separate pieces,
+     meringues and pavlova, granola, crackers, and anything cooked on the hob."""
+_TINS_VOCAB = _TINS_SIZES + "\n" + _TINS_BAKE
+_TINS_TOKEN = """\
+   - In the directions, wrap the words naming each listed tin in a tin token {{{{pan_01|words}}}},
+     copying the words exactly: "Grease two 20cm sandwich tins" -> "Grease {{{{pan_01|two 20cm sandwich tins}}}}".
+     Wrap the first mention in each step only."""
+_TINS_STEP = """\
+   - "bake_step": the 0-based position in tokenized_directions (the first step is 0, not 1) of the
+     step that bakes the main item, or null."""
+_TINS_RULES = "\n".join((_TINS_SIZES, _TINS_TOKEN, _TINS_BAKE, _TINS_STEP))
+_TINS_FILL = dict(
+    shapes=", ".join(PAN_SHAPES),
+    families=", ".join(PAN_FAMILIES),
+    hints=", ".join(HINT_KEYS),
+    bake_types=", ".join(BAKE_TYPES),
+)
+_TINS_VOCAB_TEXT = _TINS_VOCAB.format(**_TINS_FILL)
+_TINS_RULES_TEXT = _TINS_RULES.format(**_TINS_FILL)
+
+
 @prompts.register(
     "refine",
     title="Refinement (structure, Fat Tokens, review notes)",
@@ -775,12 +888,18 @@ You are a culinary data refiner. Transform this raw recipe into the structured C
 
 RULES:
 1. STRUCTURED INGREDIENTS:
-   - Assign each ingredient a unique ID (ing_01, ing_02, etc.).
+   - Assign each entry a unique ID (ing_01, ing_02, etc.).
    - Extract numeric "amount", "unit" (null if unitless), and "name".
    - "fallback_string" is the original full line, unchanged.
-   - "line_index" is the 0-based position of the source line in the RAW RECIPE
-     ingredients list. Every ingredient line gets exactly one entry with its
-     index. A section header line (e.g. "For the sauce:") gets no entry.
+   - Every line of the ingredients list gets exactly one entry, in the order the lines appear,
+     and "line_index" is that line's 0-based position in the RAW RECIPE ingredients list.
+   - "kind": "heading" for a line that names a part of the recipe and lists nothing to buy:
+     "For the sauce:", "PUDDING", "To serve:", "Garnish", a bold phase such as "**Phase 1**".
+     "kind": "ingredient" for every other line, including a food with no amount
+     ("Butter for greasing", "Salt to taste", "To serve: crusty bread").
+   - A heading has "name" set to its words without emphasis or a trailing colon, "fallback_string"
+     the line unchanged, and "amount", "unit", "converted_amount", "converted_unit", "state" null.
+     Number headings in the same ing_01, ing_02 sequence as ingredients.
    - STATE: for every ingredient with an amount and a volume or weight unit, say whether it is
      "liquid" - pourable as the recipe uses it: water, milk, cream, stock, oil, wine, juice,
      vinegar, honey, syrup, melted butter - or "solid" - everything else, including flour,
@@ -815,15 +934,36 @@ RULES:
        "Add about 1/2 cup (60 g) flour" -> "Add about {{{{ing_02|1/2 cup (60 g)|0.5 cup}}}} flour"
        "Add the remaining flour" -> "Add the remaining {{{{ing_02|flour|rest}}}}"
        "Add more flour until sticky" -> "Add more {{{{ing_02|flour|none}}}} until sticky"
+   - TEMPERATURES: wrap every temperature a direction states - an oven, a grill, frying oil, sugar,
+     water, proving, a core temperature ("until the centre reads 63°C"), a fridge or a freezer - in a
+     temperature token {{{{temp:VALUE|words}}}}. The words are the direction's own, copied exactly,
+     and the whole run when it gives one setting several ways: "180°C/160°C fan/gas mark 4" is ONE
+     token. VALUE is what the writer meant, in the writer's own unit:
+       * the figure: a number and C or F ("180C", "350F"), or a Gas Mark ("gas4", "gas0.5", "gas0.25");
+       * then ",oven" when it is an oven setting (bake, roast, preheat, a described oven);
+       * then ",fan=160C" (or F) when the writer also gives the fan-oven figure;
+       * "fan=160C" alone when the writer gives only a fan-oven figure.
+       * ",core" (and nothing else after the figure) when it is the food's internal temperature,
+         the doneness check: "until the centre reads 200°F", "an internal temperature of 93°C".
+     A number with no unit ("bake at 180") or a described oven: decide from the recipe and its
+     SOURCE SYSTEM; a described oven is slow 150C, moderate 180C, hot 220C, very hot 230C, each
+     with ",oven". Never wrap a range ("170-180°C") or words with no figure ("room temperature",
+     "warm", "lukewarm").
+   - Examples:
+       "Preheat the oven to 350°F" -> "Preheat the oven to {{{{temp:350F,oven|350°F}}}}"
+       "Bake at 180°C/160°C fan/gas mark 4" -> "Bake at {{{{temp:180C,oven,fan=160C|180°C/160°C fan/gas mark 4}}}}"
+       "Heat the oil to 180C" -> "Heat the oil to {{{{temp:180C|180C}}}}"
+       "Bake in a moderate oven" -> "Bake in a {{{{temp:180C,oven|moderate oven}}}}"
+       "Bake until it reads 93°C in the centre" -> "Bake until it reads {{{{temp:93C,core|93°C}}}} in the centre"
 
 3. PHASES:
    - If the raw recipe groups its ingredients or directions into phases,
      stages, or days (a bold heading entry such as "**Phase 1**", "**Day 1**",
      "**Soaker**"), keep every one of those headings as its own entry, in
      place, in both lists.
-   - A heading is not an ingredient: give it no amount, no unit, and no fat
-     tokens. Carry the heading text through as the entry's fallback_string
-     (ingredients) or text (directions).
+   - A heading is not an ingredient: in the ingredients list it is an entry with "kind": "heading"
+     (rule 1); in the directions it is a step whose text is the heading, with no fat tokens.
+     Never put a heading's id in a fat token.
    - Do NOT flatten, merge, renumber, or drop a phase. The reader must still
      be able to tell where one session ends and the next begins.
 
@@ -844,7 +984,10 @@ RULES:
      the SOURCE HOST exactly as given. One short quote.
    - Leave both null when nothing above applies.
 
-5. REVIEW NOTES:
+5. TINS AND BAKING:
+{_TINS_RULES_TEXT}
+
+6. REVIEW NOTES:
    - "review_notes": what the cook checking this recipe should know, as a list of
      {{"kind": ..., "text": ...}} entries, each text one plain sentence naming the exact words concerned.
    - "needs_review": something the cook should check or fix: a quantity given only in the
@@ -887,7 +1030,7 @@ def refine_json_schema() -> dict:
     """
     json_schema = _schema_for_gemini(CayenneRefinement)
     json_schema["properties"].pop("grid_categories", None)
-    return json_schema
+    return schema_without_client_fields(json_schema)
 
 
 def refine_recipe_for_cayenne(
@@ -948,7 +1091,10 @@ def build_mentions_prompt(ingredients: List[StructuredIngredient], steps: List[s
     ingredient lines with their ids, and its raw steps. The answer is quotes, not rewritten text, so
     ``core.fat_tokens.splice_mentions`` can place each token where its words are and the steps keep
     every word they had."""
-    lines = "\n".join(f"  {i.id}: {i.fallback_string}" for i in ingredients)
+    lines = "\n".join(
+        f"  {i.id}: (heading) {i.fallback_string}" if i.kind == "heading" else f"  {i.id}: {i.fallback_string}"
+        for i in ingredients
+    )
     numbered = "\n".join(f"  {n}. {text}" for n, text in enumerate(steps, start=1))
     return f"""
 You are a culinary data refiner. For the recipe below, find every mention of an ingredient in the
@@ -961,6 +1107,7 @@ RULES:
      the step, so two mentions with the same words can be told apart.
    - "ingredient_id" is the id of the ingredient line the words refer to.
    - A heading step ("**Phase 1**") has no mentions.
+   - A heading line is never a mention: no "ingredient_id" may name a line marked (heading).
 {_MENTION_USES}
    - Examples, as step text -> quote, context, use:
        "Whisk together the flour and salt" -> "flour", "Whisk together the flour and", all;
@@ -1004,6 +1151,192 @@ def tag_direction_mentions(
     if not response.text or not response.text.strip():
         raise RuntimeError("tag_direction_mentions(): Gemini returned an empty response")
     return DirectionMentions.model_validate(json.loads(response.text)).mentions
+
+
+def build_temperatures_prompt(steps: List[str], source_system: Optional[str]) -> str:
+    """The temperature backfill's prompt (Cayenne oven temperatures design): steps the deterministic
+    splice could not settle - a bare figure, or a described oven. The answer is quotes, placed by
+    ``core.temperatures.place_temperature_mentions``, so no word of a step changes."""
+    numbered = "\n".join(f"  {n}. {text}" for n, text in enumerate(steps, start=1))
+    return f"""
+You are a culinary data refiner. Find every temperature these recipe directions state that is not
+already written with its unit, and say what the writer meant.
+
+RULES:
+   - Report every temperature figure with no C or F after it ("bake at 180", "350 degrees", "375°",
+     "a 400° oven", "preheat to 425") and every described oven ("a moderate oven", "a hot oven"). A
+     degree sign alone is not a unit. Skip anything inside {{{{ }}}} and any figure already followed
+     by C, F, Celsius or Fahrenheit.
+   - "quote" is the words to wrap, copied character for character from that step; "context" is the
+     quote with about five words around it, copied the same way.
+   - "value" is what the writer meant, in the writer's unit: a number and C or F ("180C", "350F"),
+     then ",oven" when it is an oven setting. Decide the unit from the SOURCE SYSTEM and the figure:
+     US recipes write Fahrenheit; UK, EU and AU recipes write Celsius; an oven figure above 260 is
+     Fahrenheit. A described oven is slow 150C, moderate 180C, hot 220C, very hot 230C, each with ",oven".
+   - Never report a range ("170-180"), an angle ("turn it 90°"), a time, a weight, a size or a count.
+   - An oven, grill or baking figure is always reported, even when the unit must be inferred.
+
+SOURCE SYSTEM: {source_system or "unknown"}
+
+DIRECTIONS:
+{numbered}
+"""
+
+
+def tag_temperatures(
+    steps: List[str],
+    source_system: Optional[str],
+    client,
+    *,
+    limiter: Optional["GlobalRateLimiter"] = None,
+) -> List[TemperatureMention]:
+    """Every unit-less temperature in ``steps``, from one Gemini call. Raises on failure: the backfill
+    decides whether a recipe it could not ask about is skipped."""
+    response = _call_with_retry(
+        client,
+        model=GEMINI_MODEL,
+        contents=build_temperatures_prompt(steps, source_system),
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": _schema_for_gemini(TemperatureMentions),
+            # A backfill re-run must give the same answer: at the default the model reported a bare
+            # "425 degrees" on one call and nothing on the next (2026-10-13).
+            "temperature": 0,
+        },
+        what="Temperatures",
+        limiter=limiter,
+    )
+    if not response.text or not response.text.strip():
+        raise RuntimeError("tag_temperatures(): Gemini returned an empty response")
+    return TemperatureMentions.model_validate(json.loads(response.text)).mentions
+
+
+def build_pans_prompt(steps: List[str], ingredients: List[str], source_system: Optional[str]) -> str:
+    """The pans backfill's prompt (pan-aware scaling D22): the tins, bake type and baking step of a
+    recipe already saved. The answer is quotes, placed by ``core.pans.place_pan_mentions`` and
+    ``mark_core``, so no word of a step changes."""
+    numbered = "\n".join(f"  {n}. {text}" for n, text in enumerate(steps, start=1))
+    lines = "\n".join(f"  - {line}" for line in ingredients)
+    return f"""
+You are a culinary data refiner. Find the baking tins this recipe uses, what kind of bake it is,
+and the internal temperatures its directions state.
+
+RULES:
+{_TINS_VOCAB_TEXT}
+   - "bake_step": the number, as numbered in the DIRECTIONS below (1-based, like "step" below), of
+     the step that bakes the main item, or null.
+   - "mentions": for each listed tin, the first mention in each step: "step" (1-based, as numbered),
+     "quote" (the words naming the tin, copied character for character from that step, same case and
+     spacing), "context" (the quote with about five words around it, copied the same way) and "pan_id".
+   - "core": each internal (probe, doneness) temperature figure a step states ("until the centre
+     reaches 93°C", "internal temperature of 200F"), never an oven setting: "step" (1-based) and
+     "quote", the words of the figure, copied character for character, same case and spacing.
+
+SOURCE SYSTEM: {source_system or "unknown"}
+
+INGREDIENTS:
+{lines}
+
+DIRECTIONS:
+{numbered}
+"""
+
+
+_PANS_BAKE_STEP_DESC = "1-based number of the step that bakes the main item; null when nothing bakes."
+
+
+def _with_bake_step_description(schema: Any) -> Any:
+    """*schema* with every ``bake_step`` property described as the pans prompt asks for it."""
+    if isinstance(schema, dict):
+        return {
+            k: (
+                {n: ({**v, "description": _PANS_BAKE_STEP_DESC} if n == "bake_step" and isinstance(v, dict)
+                     else _with_bake_step_description(v)) for n, v in val.items()}
+                if k == "properties" and isinstance(val, dict)
+                else _with_bake_step_description(val)
+            )
+            for k, val in schema.items()
+        }
+    if isinstance(schema, list):
+        return [_with_bake_step_description(i) for i in schema]
+    return schema
+
+
+def tag_pans(
+    steps: List[str],
+    ingredients: List[str],
+    source_system: Optional[str],
+    client: Any,
+    *,
+    limiter: Optional["GlobalRateLimiter"] = None,
+) -> PanAnswer:
+    """The tins, bake type, baking step and core temperatures of one recipe, from one Gemini call.
+    Raises on failure: the backfill decides whether a recipe it could not ask about is skipped."""
+    response: Any = _call_with_retry(
+        client,
+        model=GEMINI_MODEL,
+        contents=build_pans_prompt(steps, ingredients, source_system),
+        config={
+            "response_mime_type": "application/json",
+            # RecipePan.edited and .removed are set by a person, never by the model.
+            "response_json_schema": _with_bake_step_description(schema_without_client_fields(_schema_for_gemini(PanAnswer))),
+            "temperature": 0,
+        },
+        what="Pans",
+        limiter=limiter,
+    )
+    if not response.text or not response.text.strip():
+        raise RuntimeError("tag_pans(): Gemini returned an empty response")
+    answer: PanAnswer = PanAnswer.model_validate(json.loads(response.text))
+    # Asked 1-based, like mentions and core; PanAnswer.bake_step is 0-based (R-G).
+    if answer.bake_step is not None:
+        answer.bake_step = answer.bake_step - 1 if answer.bake_step >= 1 else None
+    return answer
+
+
+def build_servings_prompt(title: str, ingredients: Sequence[str], directions: Sequence[str]) -> str:
+    """The prompt asking how many people one batch of a recipe feeds."""
+    steps = "\n".join(f"  {n}. {t}" for n, t in enumerate(directions, 1))
+    lines = "\n".join(f"  - {i}" for i in ingredients)
+    return (
+        "Estimate how many servings this recipe makes: the number of people one batch comfortably feeds, "
+        "or the number of items (cookies, slices) it yields. Answer with one whole number from 1 to 200.\n\n"
+        f"TITLE: {title}\n\nINGREDIENTS:\n{lines}\n\nDIRECTIONS:\n{steps}\n"
+    )
+
+
+def estimate_servings(
+    client: Any,
+    title: str,
+    ingredients: Sequence[str],
+    directions: Sequence[str],
+    *,
+    limiter: Optional["GlobalRateLimiter"] = None,
+) -> Optional[int]:
+    """The model's estimate of a recipe's servings, or None on any failure. Never raises."""
+    try:
+        response: Any = _call_with_retry(
+            client,
+            model=GEMINI_MODEL,
+            contents=build_servings_prompt(title, ingredients, directions),
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": {
+                    "type": "object",
+                    "properties": {"servings": {"type": "integer"}},
+                    "required": ["servings"],
+                },
+                "temperature": 0,
+            },
+            what="Servings",
+            limiter=limiter,
+        )
+        n = json.loads(response.text)["servings"]
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 200:
+            return None
+        return n
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class _RecipeTags(BaseModel):

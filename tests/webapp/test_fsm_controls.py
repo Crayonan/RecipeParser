@@ -125,7 +125,7 @@ def test_recipe_pipeline_pause_resume_cancel_with_fake(monkeypatch):
             title=raw.name,
             base_servings=4,
             structured_ingredients=[
-                StructuredIngredient(id="i1", amount=1.0, unit="cup", name="flour", fallback_string="1 cup flour")
+                StructuredIngredient(id="i1", kind="ingredient", amount=1.0, unit="cup", name="flour", fallback_string="1 cup flour")
             ],
             tokenized_directions=[TokenizedDirection(step=1, text="Mix well")],
         )

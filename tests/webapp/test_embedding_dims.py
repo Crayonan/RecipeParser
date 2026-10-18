@@ -76,7 +76,7 @@ def test_embed_stage_raises_on_non_1536():
         title="Toast",
         base_servings=1,
         structured_ingredients=[
-            StructuredIngredient(id="i1", amount=1, unit="slice", name="bread", fallback_string="1 slice bread")
+            StructuredIngredient(id="i1", kind="ingredient", amount=1, unit="slice", name="bread", fallback_string="1 slice bread")
         ],
         tokenized_directions=[TokenizedDirection(step=1, text="Toast bread")],
     )

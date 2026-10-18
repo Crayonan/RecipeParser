@@ -16,6 +16,7 @@ TID rule: this module lives in ``core/`` and therefore MUST NOT import from
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import mimetypes
 import os
@@ -25,10 +26,12 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from recipeparser.core import run_context
 from recipeparser.core.citation import Citation, host_of, resolve_citation
+from recipeparser.core.durations import Span, duration_columns
 from recipeparser.core.fsm import PipelineController
-from recipeparser.core.models import Chunk, InputType, SourceMeta
+from recipeparser.core.models import Chunk, InputType, RestoreFields, SourceMeta
 from recipeparser.core.ports import CategorySource, ImageStore
 from recipeparser.core.rate_limiter import GlobalRateLimiter
+from recipeparser.core.servings import servings_for_restore
 from recipeparser.core.stages.assemble import assemble
 from recipeparser.core.stages.embed import embed
 from recipeparser.core.stages.extract import extract
@@ -36,7 +39,6 @@ from recipeparser.core.stages.refine import refine
 from recipeparser.core.stages.tag import TAG_BATCH_SIZE, TagFailure, tag_batch
 from recipeparser.gemini import categorize_batch
 from recipeparser.models import CayenneRecipe, CayenneRefinement, IngestResponse, Photo
-from recipeparser.utils import title_case
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +71,34 @@ class _ChunkFailed(Exception):
         self.skipped = skipped
 
 
+def chunk_stages(chunk: Chunk) -> List[str]:
+    """The ordered stage names to run for ``chunk`` (the table in ``RecipePipeline._get_stages``)."""
+    if chunk.skip_reason is not None:
+        return []                        # a skipped line: no stage, no model call (D6)
+    if chunk.input_type == InputType.PAPRIKA_CAYENNE:
+        if chunk.pre_parsed_embedding is not None:
+            return ["ASSEMBLE"]          # $0 — skip all Gemini calls
+        return ["EMBED", "ASSEMBLE"]     # Only embed: skip extract, refine and tag
+    # URL, PDF, EPUB, IMAGE, PAPRIKA_LEGACY — full pipeline
+    return ["EXTRACT", "REFINE", "EMBED", "ASSEMBLE", "TAG"]
+
+
+def chunk_needs_ai(chunk: Chunk) -> bool:
+    """True when the chunk's recipe is made by the model (REFINE runs): the decision behind ``ai_processed``.
+
+    Not ``pre_parsed is None``: a Cayenne chunk without ``pre_parsed`` still takes no
+    REFINE, and a non-Cayenne chunk with one still does.
+    """
+    return "REFINE" in chunk_stages(chunk)
+
+
+def chunk_calls_ai(chunk: Chunk) -> bool:
+    """True when any stage of the chunk calls Gemini: EXTRACT, REFINE, EMBED and TAG do, ASSEMBLE does not.
+
+    The kill switch covers all of these; only a chunk that ``chunk_needs_ai`` (REFINE) counts against the cap.
+    """
+    return any(stage != "ASSEMBLE" for stage in chunk_stages(chunk))
+
 
 class RecipePipeline:
     """
@@ -100,6 +130,7 @@ class RecipePipeline:
         rpm: Optional[int] = None,
         image_store: Optional[ImageStore] = None,
         categorize_fn: Optional[Callable[..., Dict[str, List[str]]]] = None,
+        picture_source: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -114,6 +145,11 @@ class RecipePipeline:
                                 dropped, which is what shipped before.
             categorize_fn:      The TAG stage's model call, ``gemini.categorize_batch``
                                 by default; a test passes a fake.
+            picture_source:     Optional bucket-picture source (``owns(url)`` and
+                                ``download(url)``): a Cayenne restore whose export
+                                names a picture without carrying its bytes has it
+                                copied into the new account.  Without one the
+                                address is kept as it is.
         """
         self._client = client
         self._controller = controller
@@ -121,6 +157,7 @@ class RecipePipeline:
         self._cap = max(1, concurrency)
         self._image_store = image_store
         self._categorize_fn = categorize_fn or categorize_batch
+        self._picture_source = picture_source
         # Initialise (or retrieve) the process-level rate limiter.
         if rpm is not None:
             self._limiter = GlobalRateLimiter(rpm=rpm)
@@ -137,7 +174,7 @@ class RecipePipeline:
         on_progress: Optional[Callable[[str, int, int], None]] = None,
         user_id: str = "",
         *,
-        on_result: Optional[Callable[[IngestResponse], None]] = None,
+        on_result: Optional[Callable[[IngestResponse, bool], Optional[bool]]] = None,
         on_skip: Optional[Callable[[Chunk, str, int], None]] = None,
         on_tags: Optional[Callable[[IngestResponse], None]] = None,
         on_tag_failed: Optional[Callable[[TagFailure], None]] = None,
@@ -154,7 +191,11 @@ class RecipePipeline:
             on_result:   Optional callback fired once per assembled recipe, in
                          completion order, from this thread.  Lets a caller
                          persist results as they arrive instead of after the
-                         whole batch.
+                         whole batch.  The second argument is True when REFINE
+                         ran for the recipe's chunk (AI processed it) and False
+                         for a Cayenne restore (AI caps D3).  Returning
+                         ``False`` (exactly) means the recipe was not written,
+                         so it is not queued for TAG; ``None``/``True`` keep it.
             on_skip:     Optional callback ``(chunk, reason, index) -> None``
                          fired for every chunk that produced no result because
                          of a failure.  ``index`` is the chunk's zero-based
@@ -222,6 +263,7 @@ class RecipePipeline:
                     chunk.image_url = self._image_store.put(
                         chunk.image_bytes, str(uuid.uuid4()), chunk.image_content_type
                     )
+                self._restore_bucket_picture(chunk)
                 stages = self._get_stages(chunk)
                 return self._process_chunk(chunk, stages)
             except _Cancelled:
@@ -282,7 +324,10 @@ class RecipePipeline:
             # position is the only identification a labelless (EPUB/PDF)
             # chunk has.
             future_to_chunk = {
-                executor.submit(_worker, chunk): (chunk, index)
+                # Each worker runs in a copy of the caller's context, so its Gemini calls are
+                # attributed to the job (usage.py, AI caps D8). One copy per submit: a Context
+                # cannot be entered by two threads at once.
+                executor.submit(contextvars.copy_context().run, _worker, chunk): (chunk, index)
                 for index, chunk in enumerate(chunks)
             }
 
@@ -314,7 +359,8 @@ class RecipePipeline:
                     for position, result in enumerate(outcome.results):
                         if on_result is not None:
                             try:
-                                on_result(result)
+                                if on_result(result, needs_tags) is False:
+                                    continue  # refused (the beta cap): not written, so nothing to tag
                             except Exception:
                                 # Deliberately NOT re-raised, unlike on_progress below. That
                                 # callback guards a stale stage label, which is indistinguishable
@@ -378,6 +424,7 @@ class RecipePipeline:
     def _get_stages(self, chunk: Chunk) -> List[str]:
         """
         Return the ordered list of stage names to execute for this chunk.
+        (The routing itself is ``chunk_stages``, which ``chunk_needs_ai`` shares.)
 
         Routing table (§4.2 / §7.3 of PIPELINE_REFACTOR.md):
           PAPRIKA_CAYENNE + embedding  → ['ASSEMBLE']
@@ -385,16 +432,38 @@ class RecipePipeline:
           All other InputTypes         → ['EXTRACT', 'REFINE', 'EMBED', 'ASSEMBLE', 'TAG']
           (TAG is not per chunk: it runs over every TAG_BATCH_SIZE finished recipes, in run())
         """
-        if chunk.input_type == InputType.PAPRIKA_CAYENNE:
-            if chunk.pre_parsed_embedding is not None:
-                return ["ASSEMBLE"]          # $0 — skip all Gemini calls
-            return ["EMBED", "ASSEMBLE"]     # Only embed: skip extract, refine and tag
-        # URL, PDF, EPUB, IMAGE, PAPRIKA_LEGACY — full pipeline
-        return ["EXTRACT", "REFINE", "EMBED", "ASSEMBLE", "TAG"]
+        return chunk_stages(chunk)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Per-chunk processing
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _restore_bucket_picture(self, chunk: Chunk) -> None:
+        """Make a Cayenne restore's bucket picture its own, or drop the address (R1).
+
+        The export names the old account's object; it is downloaded and stored again unless
+        the chunk already carries bytes.  If that fails the recipe goes without a picture:
+        the old address dies with the old account, so it is never kept.
+        """
+        source = self._picture_source
+        pr = chunk.pre_parsed
+        if source is None or pr is None or chunk.input_type != InputType.PAPRIKA_CAYENNE:
+            return
+        old_url = getattr(pr, "image_url", None)
+        if not old_url or not source.owns(old_url):
+            return
+        if not chunk.image_url and not chunk.image_bytes and self._image_store is not None:
+            try:
+                got = source.download(old_url)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("restore: could not copy the picture %s (%s).", old_url, exc)
+                got = None
+            if got is not None:
+                chunk.image_url = self._image_store.put(got[0], str(uuid.uuid4()), got[1])
+        if not chunk.image_url:
+            log.warning("restore: the recipe %r goes without its picture.", chunk.label or pr.title)
+            pr.image_url = None
+            pr.image_source = None
 
     def _process_chunk(
         self,
@@ -412,6 +481,9 @@ class RecipePipeline:
         Exceptions propagate to the caller (run()) which handles them in the
         per-chunk error boundary.
         """
+        if chunk.skip_reason is not None:
+            return ChunkResult([], [chunk.skip_reason])
+
         results: List[IngestResponse] = []
 
         # ── Fast-path: PAPRIKA_CAYENNE with pre_parsed + embedding ────────────
@@ -438,6 +510,8 @@ class RecipePipeline:
                 direction_steps=list(getattr(pr, "direction_steps", []) or []),
                 servings_text=None,
                 citation=chunk.citation or _citation_from(pr),
+                spans=_restore_spans(pr),
+                restore=_restore_fields(pr),
             )
             result.attach_photo(_chunk_photo(chunk))
             return ChunkResult([result], [])
@@ -467,6 +541,8 @@ class RecipePipeline:
                 direction_steps=list(getattr(pr, "direction_steps", []) or []),
                 servings_text=None,
                 citation=chunk.citation or _citation_from(pr),
+                spans=_restore_spans(pr),
+                restore=_restore_fields(pr),
             )
             result.attach_photo(_chunk_photo(chunk))
             return ChunkResult([result], [])
@@ -633,11 +709,66 @@ def _pre_parsed_to_refinement(
     here (``title``, ``base_servings``, ``structured_ingredients``,
     ``tokenized_directions``), so the shim works for either type.
 
-    The title is title-cased here as REFINE does for every other input: a restore skips REFINE.
+    The title is kept exactly as given: a Cayenne restore is the cook's own title, and
+    title-casing it would undo what they typed.  The measures REFINE detected ride along.
     """
     return CayenneRefinement(
-        title=title_case(pr.title),
+        title=pr.title,
         base_servings=pr.base_servings,
         structured_ingredients=pr.structured_ingredients,
         tokenized_directions=pr.tokenized_directions,
+        # A restore skips REFINE, so the tins and the bake would be dropped here. getattr: an archive
+        # that predates them has none.
+        pans=list(getattr(pr, "pans", None) or []),
+        bake_type=getattr(pr, "bake_type", None),
+        bake_step=getattr(pr, "bake_step", None),
+        source_uom_system_detected=getattr(pr, "source_uom_system_detected", None),
+        source_uom_system_evidence=getattr(pr, "source_uom_system_evidence", None),
+    )
+
+
+_SPAN_KEYS = (
+    "prep_min_minutes", "prep_max_minutes", "prep_note",
+    "cook_min_minutes", "cook_max_minutes", "cook_note",
+    "servings_min", "servings_max", "servings_note",
+    "base_servings", "servings_source",
+)
+_SERVINGS_KEYS = ("base_servings", "servings_source")
+
+
+def _restore_spans(pr: "CayenneRecipe | IngestResponse") -> Dict[str, Any]:
+    """
+    The span columns of a pre-parsed recipe, as stored.  Re-deriving them from the text
+    columns would lose what only the structured columns hold (a servings span and its note).
+    An archive that predates the columns carries none of them; for that alone the text is parsed.
+
+    servings_source is kept as exported when the archive carries it (even as null).  An archive
+    from before 9.17 has none, so it is derived here without the model (a restore makes no AI
+    call): the tin table may replace base_servings; otherwise the exported number stays.
+    """
+    if not any(k in pr.model_fields_set for k in _SPAN_KEYS if k not in _SERVINGS_KEYS):
+        cols = duration_columns(pr.prep_time, pr.cook_time, None, pr.base_servings)
+    else:
+        cols = {k: getattr(pr, k) for k in _SPAN_KEYS if k != "servings_source"}
+    if "servings_source" in pr.model_fields_set:
+        cols["servings_source"] = pr.servings_source
+        return cols
+    sv = servings_for_restore(
+        Span(cols["servings_min"], cols["servings_max"], cols["servings_note"]),
+        list(getattr(pr, "direction_steps", None) or []),
+        list(getattr(pr, "pans", None) or []),
+        getattr(pr, "bake_type", None),
+        cols["base_servings"],
+    )
+    cols["base_servings"], cols["servings_source"] = sv.base, sv.source
+    return cols
+
+
+def _restore_fields(pr: "CayenneRecipe | IngestResponse") -> RestoreFields:
+    """The favourite, chosen measures, picture origin and stale flag a Cayenne export carried."""
+    return RestoreFields(
+        is_favourite=bool(pr.is_favourite),
+        source_uom_system=pr.source_uom_system,
+        image_source=pr.image_source,
+        stale=bool(pr.stale),
     )

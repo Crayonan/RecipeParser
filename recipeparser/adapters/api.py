@@ -48,12 +48,15 @@ from google.genai import errors as genai_errors
 from pydantic import BaseModel, Field
 
 import recipeparser.gemini as _gemini_mod
+from recipeparser import usage
+from recipeparser.adapters.ai_gate import AiGate
 from recipeparser.adapters.idempotency import HEADER as _IDEMPOTENCY_HEADER
 from recipeparser.adapters.idempotency import IdempotencyCache
 from recipeparser.adapters.job_sink import JobSink
 from recipeparser.adapters.shares_api import RecipientCheckLimiter
 from recipeparser.adapters.shares_api import build_router as _build_share_router
 from recipeparser.adapters.shopping_api import build_router as _build_shopping_router
+from recipeparser.adapters.household_api import build_router as _build_household_router
 from recipeparser.config import MAX_UPLOAD_BYTES
 from recipeparser.config import live_writes_blocked as _live_writes_blocked
 from recipeparser.core.citation import web_citation
@@ -61,7 +64,7 @@ from recipeparser.core.clock import utc_timestamp
 from recipeparser.core.fsm import PipelineController
 from recipeparser.core.models import Chunk, InputType, SourceMeta
 from recipeparser.core.picture_gen import NoPictureError, build_picture_prompt, generate_picture, to_jpeg
-from recipeparser.core.pipeline import RecipePipeline
+from recipeparser.core.pipeline import RecipePipeline, chunk_calls_ai, chunk_needs_ai
 from recipeparser.core.taxonomy import descendants_of
 from recipeparser.exceptions import UnreadableInputError
 from recipeparser.io.category_sources.supabase_source import SupabaseCategorySource
@@ -73,7 +76,8 @@ from recipeparser.io.readers.url import PAGE_USER_AGENT as _PAGE_USER_AGENT
 from recipeparser.io.readers.url import PageMeta, UrlReader, looks_like_badge, page_meta_from_html
 from recipeparser.io.readers.url import is_unsafe_fetch_target as _is_unsafe_fetch_target
 from recipeparser.io.writers.image_store import SupabaseImageStore
-from recipeparser.io.writers.supabase import write_recipe_to_supabase
+from recipeparser.io.category_sources.restore_paths import clean_path, ensure_category_paths, restore_grid
+from recipeparser.io.writers.supabase import _get_creds, write_recipe_to_supabase
 from recipeparser.logging_setup import configure_logging
 
 # Before the first logger call in this module: uvicorn leaves the root logger
@@ -246,8 +250,16 @@ async def _lifespan(_app: FastAPI):
         from recipeparser.adapters.recat_worker import RecatWorker  # noqa: PLC0415
         from recipeparser.adapters.share_worker import ShareWorker  # noqa: PLC0415
         workers: list = [
-            _rw.RegenWorker(supabase, _get_client()),
-            RecatWorker(supabase, _get_client()),
+            _rw.RegenWorker(
+                supabase, _get_client(),
+                ai_allowed=_ai_gate.ai_allowed,
+                usage_client=lambda: _get_supabase_service_client(),
+            ),
+            RecatWorker(
+                supabase, _get_client(),
+                ai_allowed=_ai_gate.ai_allowed,
+                usage_client=lambda: _get_supabase_service_client(),
+            ),
             ShareWorker(supabase, SupabaseImageStore()),
         ]
         task = asyncio.create_task(_rw.run_workers(workers, stop, polls=_worker_polls))
@@ -579,16 +591,83 @@ class EmbedResponse(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The AI gate (AI caps spec §2). A lambda, so a test's monkeypatch of
+# _get_supabase_service_client reaches it, as the share router's does.
+# ---------------------------------------------------------------------------
+_ai_gate = AiGate(lambda: _get_supabase_service_client())
+
+
+def _require_ai(user: dict[str, Any] = Depends(_verify_supabase_jwt)) -> None:
+    _ai_gate.check(user.get("sub", ""))
+
+
+def _require_ai_import(user: dict[str, Any] = Depends(_verify_supabase_jwt)) -> None:
+    _ai_gate.check(user.get("sub", ""), imports=True)
+
+
+_DEFERRED_GATE_SUFFIX = ".paprikarecipes"
+
+
+def _defers_ai_gate(filename: Optional[str]) -> bool:
+    """A Paprika export is gated after it is read, and only if some recipe in it needs AI (owner ruling)."""
+    return (filename or "").lower().endswith(_DEFERRED_GATE_SUFFIX)
+
+
+def _require_ai_import_upload(
+    user: dict[str, Any] = Depends(_verify_supabase_jwt),
+    file: UploadFile = File(...),
+) -> bool:
+    """The /jobs/file gate: the import check now, except for a .paprikarecipes upload.
+
+    Returns True when the check was deferred to the job (``_run_ingestion_job`` makes it after the read),
+    because a Cayenne restore never counts against the cap, and one with stored embeddings makes no AI call at all.
+    """
+    if _defers_ai_gate(file.filename):
+        return True
+    _ai_gate.check(user.get("sub", ""), imports=True)
+    return False
+
+
+class _AiRefusal(Exception):
+    """The AI gate's refusal, carried to the job's error path with its sentence as the message."""
+
+
+def _check_ai_after_read(user_id: str, chunks: List[Chunk]) -> None:
+    """The gate for a deferred job; a refusal is the job's error.
+
+    Some chunk runs REFINE: the full import check (pause and cap). Otherwise some chunk still calls
+    Gemini (a restore without a stored embedding runs EMBED): the pause only, since restores never count.
+    Otherwise (every restore has its embedding) no check.
+    """
+    if any(chunk_needs_ai(c) for c in chunks):
+        imports = True
+    elif any(chunk_calls_ai(c) for c in chunks):
+        imports = False
+    else:
+        return
+    try:
+        _ai_gate.check(user_id, imports=imports)
+    except HTTPException as exc:
+        raise _AiRefusal(exc.detail) from exc
+
+
+def _require_ai_embed(user: dict[str, Any] = Depends(_verify_supabase_jwt)) -> None:
+    _ai_gate.check(user.get("sub", ""), embed=True)
+
+
 @app.post("/embed", response_model=EmbedResponse, status_code=200)
 def embed_text(
     body: EmbedRequest,
     user: dict[str, Any] = Depends(_verify_supabase_jwt),
+    _gate: None = Depends(_require_ai_embed),
 ) -> EmbedResponse:
     """Generate a 1536-dim embedding for the given text."""
     try:
         client = _get_client()  # validates API key is present
         # One retry, not the whole ladder: a person is waiting on this search.
-        embedding = _gemini_mod.get_embeddings(body.text, client, max_retries=1)
+        with usage.attributed(user.get("sub", ""), "search", get_client=_get_supabase_service_client):
+            embedding = _gemini_mod.get_embeddings(body.text, client, max_retries=1)
         return EmbedResponse(embedding=embedding)
     except Exception as exc:
         raise HTTPException(
@@ -616,6 +695,15 @@ def _get_supabase_service_client() -> Any:
         return None
     from supabase import create_client  # type: ignore[import-not-found]
     return create_client(supabase_url, supabase_key)
+
+
+def _picture_source() -> Any:
+    """The bucket-picture source a Cayenne restore copies pictures with, or None without credentials."""
+    client = _get_supabase_service_client()
+    if client is None:
+        return None
+    from recipeparser.io.writers.picture_copy import BucketPictures
+    return BucketPictures(os.environ.get("SUPABASE_URL", ""), client)
 
 
 def _create_ingestion_job(
@@ -675,6 +763,8 @@ def _job_error_message(name: Optional[str], exc: BaseException) -> str:
     so the two join as a sentence. Anything else keeps the "<name>: <error>"
     shape. A pasted-text job has no name and reports the error alone.
     """
+    if isinstance(exc, _AiRefusal):
+        return str(exc)  # the gate's own sentence, as the endpoint would have sent it
     if not name:
         return str(exc)
     if isinstance(exc, UnreadableInputError):
@@ -959,6 +1049,77 @@ def _select_reader(filename: str, content_type: str) -> str:
 # The ingestion job both job endpoints start
 # ---------------------------------------------------------------------------
 
+def _create_restore_categories(user_id: str, chunks: List[Chunk]) -> Dict[str, List[Tuple[str, str]]]:
+    """Create the categories a Cayenne restore needs and point each chunk at its leaves.
+
+    Reads every ``_cayenne_meta`` category path, creates the missing nodes, then replaces the
+    chunk's ``grid_categories`` with the leaves that were placed, so the writer's junction write
+    links them by name. A v1 archive (no non-empty path) is left alone. A failure creating them
+    is logged and the restore goes on: the leaves are linked by name wherever they already exist.
+
+    Returns, by recipe title, the ``(leaf, reason)`` of each path that depth cut short, for the
+    job to report as a refused link on that recipe (never a skipped line).
+    """
+    wanted = []
+    for chunk in chunks:
+        raw = getattr(chunk.pre_parsed, "category_paths", None)
+        if chunk.input_type != InputType.PAPRIKA_CAYENNE or not isinstance(raw, list):
+            continue
+        paths = [clean_path(p) for p in raw if isinstance(p, (list, tuple))]
+        paths = [p for p in paths if p]
+        if paths:
+            wanted.append((chunk, paths))
+    if not wanted:
+        return {}
+    try:
+        url, key = _get_creds()
+        placed = ensure_category_paths(
+            user_id, [p for _, ps in wanted for p in ps], supabase_url=url, service_key=key,
+        )
+    except Exception:
+        logger.warning(
+            "Restore: could not create the categories for user %s; linking those that exist.",
+            user_id, exc_info=True,
+        )
+        placed = {p: p[-1] for _, ps in wanted for p in ps}
+    too_deep: Dict[str, List[Tuple[str, str]]] = {}
+    for chunk, paths in wanted:
+        names = []
+        for path in paths:
+            name = placed.get(path)
+            if name is None:
+                continue
+            names.append(name)
+            if name != path[-1]:
+                note = (path[-1], f"category '{path[-1]}' is nested too deep to restore")
+                notes = too_deep.setdefault(chunk.pre_parsed.title, [])
+                if note not in notes:
+                    notes.append(note)
+        chunk.pre_parsed.grid_categories = restore_grid(names)
+    return too_deep
+
+
+def _reporting_deep_paths(
+    write: Callable[..., Any], too_deep: Dict[str, List[Tuple[str, str]]],
+) -> Callable[..., Any]:
+    """Wrap the recipe writer so a too-deep note reaches the job through ``on_link_refused``.
+
+    The notes are keyed by recipe title and go out right after that recipe is written, so the
+    sink's count and log name the recipe whose path was cut.
+    """
+    pending = {t: list(n) for t, n in too_deep.items()}
+
+    def _write(recipe: Any, user_id: str, **kwargs: Any) -> Any:
+        result = write(recipe, user_id, **kwargs)
+        refuse = kwargs.get("on_link_refused")
+        for leaf, reason in pending.pop(getattr(recipe, "title", None), []):
+            if refuse is not None:
+                refuse({"category_id": leaf, "reason": reason})
+        return result
+
+    return _write
+
+
 async def _run_ingestion_job(
     job_id: str,
     user_id: str,
@@ -966,6 +1127,7 @@ async def _run_ingestion_job(
     read: Callable[[], Awaitable[Tuple[Any, List[Chunk]]]],
     failure_name: Optional[str],
     log_label: str,
+    gate_after_read: bool = False,
 ) -> None:
     """Run one ingestion job to its end: the half ``POST /jobs`` and ``POST /jobs/file`` share.
 
@@ -974,78 +1136,102 @@ async def _run_ingestion_job(
     category map, the sink, progress, the pipeline, and the job row's last write.
     A failure in ``read`` or after it finishes the row as an error, worded with
     ``failure_name`` (the URL or the file name).
+
+    ``gate_after_read`` is set for a .paprikarecipes upload, which the endpoint did not gate:
+    once the chunks are read, the import gate runs if any of them needs AI, and the pause alone if
+    only an EMBED call is left. A restore with stored embeddings (no AI call) runs at the cap and
+    while paused; one without them is covered by the pause but never by the cap.
     """
     # NOTE: Do NOT call controller.transition("start") here.
     # RecipePipeline.run() calls it internally (IDLE → RUNNING).
     # Calling it here first would cause an invalid double-transition.
     sink = None
-    try:
-        client, chunks = await read()
+    with usage.attributed(user_id, "import", job_id, get_client=_get_supabase_service_client):
+        try:
+            client, chunks = await read()
+            if gate_after_read:
+                await asyncio.to_thread(_check_ai_after_read, user_id, chunks)
 
-        category_source = SupabaseCategorySource()
-        category_ids = category_source.load_category_ids(user_id)
-        sink = JobSink(
-            job_id=job_id,
-            user_id=user_id,
-            category_ids=category_ids,
-            write=write_recipe_to_supabase,
-        )
-        write_progress = _make_progress_writer(job_id)
-
-        def _on_progress(stage: str, completed: int, total: int) -> None:
-            before = len(sink.progress_updates)
-            sink.on_progress(stage, completed, total)
-            if len(sink.progress_updates) > before:
-                write_progress(sink.progress_updates[-1])
-
-        # RecipePipeline.run() transitions IDLE→RUNNING internally,
-        # processes all chunks (with per-chunk error isolation), then
-        # transitions RUNNING→IDLE on success.
-        pipeline = RecipePipeline(
-            client=client,
-            controller=controller,
-            category_source=category_source,
-            image_store=SupabaseImageStore(),
-        )
-        await asyncio.to_thread(_update_total_chunks, job_id, len(chunks), _source_key_of(chunks))
-        await asyncio.to_thread(
-            lambda: pipeline.run(
-                chunks,
-                on_progress=_on_progress,
+            too_deep = await asyncio.to_thread(_create_restore_categories, user_id, chunks)
+            category_source = SupabaseCategorySource()
+            category_ids = category_source.load_category_ids(user_id)
+            sink = JobSink(
+                job_id=job_id,
                 user_id=user_id,
-                on_result=sink.on_result,
-                on_skip=sink.on_skip,
-                on_tags=sink.on_tags,
-                on_tag_failed=sink.on_tag_failed,
+                category_ids=category_ids,
+                write=_reporting_deep_paths(write_recipe_to_supabase, too_deep),
+                consume=_ai_gate.consume_recipe,
+                on_cap=controller.request_cancel,
             )
-        )
-        logger.info(
-            "Job %s completed — %d recipe(s), %d skipped, %d category link(s) refused.",
-            job_id, sink.recipe_count, sink.skipped_count, sink.refused_link_count,
-        )
-        await asyncio.to_thread(
-            _finalize_ingestion_job,
-            job_id,
-            # The controller is back at IDLE by now, so the flag is the only
-            # thing that still knows the user pressed Cancel (spec 5.1).
-            sink.finalize_payload(True, cancelled=controller.cancel_requested),
-        )
-    except Exception as exc:
-        logger.error("%s %s failed: %s", log_label, job_id, exc, exc_info=True)
-        # Transition to IDLE via "error" event.  The FSM allows this from
-        # RUNNING, PAUSING, and RESUMING states.  If the pipeline never
-        # started (e.g. a reader raised before pipeline.run()), the controller
-        # is still IDLE and the transition is a no-op (logs a warning).
-        controller.transition("error")
-        message = _job_error_message(failure_name, exc)
-        payload = (
-            sink.finalize_payload(False, message)
-            if sink is not None
-            else {"status": "error", "stage": "ERROR", "error_message": message}
-        )
-        await asyncio.to_thread(_finalize_ingestion_job, job_id, payload)
-    finally:
-        _active_jobs.pop(job_id, None)
+            # For the closing note only; consume_recipe is what enforces the cap. A failed read
+            # must not fail the import, so it falls back to a note without the number.
+            try:
+                allowance = await asyncio.to_thread(_ai_gate.allowance, user_id)
+                sink.cap = allowance.recipe_cap if allowance is not None else None
+            except Exception:
+                logger.exception("Job %s: could not read the recipe allowance for the cap note.", job_id)
+            write_progress = _make_progress_writer(job_id)
+
+            def _on_progress(stage: str, completed: int, total: int) -> None:
+                before = len(sink.progress_updates)
+                sink.on_progress(stage, completed, total)
+                if len(sink.progress_updates) > before:
+                    write_progress(sink.progress_updates[-1])
+
+            # RecipePipeline.run() transitions IDLE→RUNNING internally,
+            # processes all chunks (with per-chunk error isolation), then
+            # transitions RUNNING→IDLE on success.
+            pipeline = RecipePipeline(
+                client=client,
+                controller=controller,
+                category_source=category_source,
+                image_store=SupabaseImageStore(),
+                picture_source=_picture_source() if any(
+                    c.input_type == InputType.PAPRIKA_CAYENNE for c in chunks
+                ) else None,
+            )
+            await asyncio.to_thread(_update_total_chunks, job_id, len(chunks), _source_key_of(chunks))
+            await asyncio.to_thread(
+                lambda: pipeline.run(
+                    chunks,
+                    on_progress=_on_progress,
+                    user_id=user_id,
+                    on_result=sink.on_result,
+                    on_skip=sink.on_skip,
+                    on_tags=sink.on_tags,
+                    on_tag_failed=sink.on_tag_failed,
+                )
+            )
+            logger.info(
+                "Job %s completed — %d recipe(s), %d skipped, %d category link(s) refused.",
+                job_id, sink.recipe_count, sink.skipped_count, sink.refused_link_count,
+            )
+            await asyncio.to_thread(
+                _finalize_ingestion_job,
+                job_id,
+                # The controller is back at IDLE by now, so the flag is the only
+                # thing that still knows the user pressed Cancel (spec 5.1).
+                sink.finalize_payload(True, cancelled=controller.cancel_requested),
+            )
+        except Exception as exc:
+            if isinstance(exc, _AiRefusal):
+                logger.warning("%s %s refused by the AI gate: %s", log_label, job_id, exc)
+            else:
+                logger.error("%s %s failed: %s", log_label, job_id, exc, exc_info=True)
+            # Transition to IDLE via "error" event.  The FSM allows this from
+            # RUNNING, PAUSING, and RESUMING states.  If the pipeline never
+            # started (e.g. a reader raised before pipeline.run()), the controller
+            # is still IDLE and the transition is a no-op (logs a warning).
+            controller.transition("error")
+            message = _job_error_message(failure_name, exc)
+            payload = (
+                sink.finalize_payload(False, message)
+                if sink is not None
+                else {"status": "error", "stage": "ERROR", "error_message": message}
+            )
+            await asyncio.to_thread(_finalize_ingestion_job, job_id, payload)
+        finally:
+            _active_jobs.pop(job_id, None)
 
 
 
@@ -1063,6 +1249,7 @@ class JobsRequest(BaseModel):
 async def submit_job(
     body: JobsRequest,
     user: dict[str, Any] = Depends(_verify_supabase_jwt),
+    _gate: None = Depends(_require_ai_import),
     idempotency_key: Optional[str] = Header(default=None, alias=_IDEMPOTENCY_HEADER),
 ) -> AsyncJobResponse:
     """Fire-and-forget URL or text ingestion job.
@@ -1156,6 +1343,7 @@ async def submit_job(
 async def submit_file_job(
     file: UploadFile = File(...),
     user: dict[str, Any] = Depends(_verify_supabase_jwt),
+    gate_after_read: bool = Depends(_require_ai_import_upload),
     idempotency_key: Optional[str] = Header(default=None, alias=_IDEMPOTENCY_HEADER),
 ) -> AsyncJobResponse:
     """Fire-and-forget file upload ingestion job.
@@ -1226,7 +1414,7 @@ async def submit_file_job(
             return client, chunks
 
         _create_ingestion_job(job_id, user_id, source_hint=filename or None)
-        asyncio.create_task(_run_ingestion_job(job_id, user_id, controller, _read, filename, "File job"))
+        asyncio.create_task(_run_ingestion_job(job_id, user_id, controller, _read, filename, "File job", gate_after_read=gate_after_read))
         slot.done({"job_id": job_id})
         return AsyncJobResponse(job_id=job_id)
 
@@ -1267,6 +1455,7 @@ class RecategorizeRequest(BaseModel):
 def submit_recategorize_job(
     body: RecategorizeRequest,
     user: dict[str, Any] = Depends(_verify_supabase_jwt),
+    _gate: None = Depends(_require_ai),
 ) -> AsyncJobResponse:
     """Queue a bulk recategorise over the caller's whole library.
 
@@ -1696,6 +1885,7 @@ async def generate_recipe_image(
     recipe_id: str,
     body: PictureRequest,
     user: dict[str, Any] = Depends(_verify_supabase_jwt),
+    _gate: None = Depends(_require_ai),
 ) -> Response:
     """A generated picture of the recipe's dish, as JPEG bytes. Nothing is stored.
 
@@ -1726,7 +1916,8 @@ async def generate_recipe_image(
         return to_jpeg(data)
 
     try:
-        jpeg = await asyncio.to_thread(_make_picture)
+        with usage.attributed(user_id, "picture", get_client=_get_supabase_service_client):
+            jpeg = await asyncio.to_thread(_make_picture)
     except NoPictureError as exc:
         logger.warning("No picture for recipe %s: %s", recipe_id, exc)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=_NO_PICTURE) from exc
@@ -1770,4 +1961,14 @@ app.include_router(_build_share_router(
 # ---------------------------------------------------------------------------
 # The endpoint lives in shopping_api.py. The client factory is a lambda so a
 # test can replace _get_client, as the shares block does for Supabase.
-app.include_router(_build_shopping_router(_verify_supabase_jwt, lambda: _get_client()))
+app.include_router(_build_shopping_router(_verify_supabase_jwt, lambda: _get_client(), _require_ai, lambda: _get_supabase_service_client()))
+
+# ---------------------------------------------------------------------------
+# Households — POST /household/invites, /invites/{id}/accept|decline|cancel, /leave,
+# /members/{id}/remove, /copy (Cayenne's household shopping design, Part 3)
+# ---------------------------------------------------------------------------
+# The endpoints live in household_api.py. The recipient-check limiter and the idempotency cache are
+# the sharing endpoints' own: one budget of checks, one answer per Idempotency-Key.
+app.include_router(_build_household_router(
+    _verify_supabase_jwt, lambda: _get_supabase_service_client(), _share_check_limiter, _idempotency,
+))

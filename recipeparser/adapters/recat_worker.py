@@ -20,8 +20,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from recipeparser import usage
 from recipeparser.core.clock import utc_timestamp
 from recipeparser.core.stages.categorize import filter_batch_result
+from recipeparser.core.stages.tag import TAG_BATCH_SIZE
 from recipeparser.core.taxonomy import parents_from_rows, root_of
 from recipeparser.gemini import categorize_batch
 
@@ -139,12 +141,16 @@ class RecatWorker:
         gemini_client: Any,
         *,
         categorize_fn: Callable[..., Dict[str, List[str]]] = categorize_batch,
-        batch_size: int = 10,
+        batch_size: int = TAG_BATCH_SIZE,
+        ai_allowed: Callable[[str], bool] = lambda _u: True,
+        usage_client: Callable[[], Any] = lambda: None,
     ) -> None:
         self._sb = supabase
         self._client = gemini_client
         self._categorize = categorize_fn
         self._batch_size = max(1, batch_size)
+        self._ai_allowed = ai_allowed
+        self._usage_client = usage_client
         self._held: Optional[_HeldJob] = None
 
     # ── one poll: at most one batch ─────────────────────────────────────
@@ -171,8 +177,15 @@ class RecatWorker:
             if self._held is None:
                 return 1                          # finished at the start, nothing to run
         held = self._held
+        if not self._ai_allowed(held.user_id):
+            # Paused and not exempt: the job waits, held, for the pause to lift. It writes
+            # nothing meanwhile, so its updated_at is not refreshed; that relies on the
+            # single API process (spec D9) -- a second worker process could reclaim it
+            # through the stale-running path after a long pause.
+            return 0
         try:
-            finished = self._step(held)
+            with usage.attributed(held.user_id, "recat", held.job_id, get_client=self._usage_client):
+                finished = self._step(held)
         except Exception as exc:  # noqa: BLE001
             # Let go first: if the terminal write fails too, the next poll must not
             # keep feeding batches to a job it has already given up on.

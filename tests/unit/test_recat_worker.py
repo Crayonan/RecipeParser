@@ -118,9 +118,9 @@ def _recipes(n):
             for i in range(n)]
 
 
-def _worker(fake, categorize_fn):
+def _worker(fake, categorize_fn, **kwargs):
     from recipeparser.adapters.recat_worker import RecatWorker
-    return RecatWorker(fake, gemini_client=MagicMock(), categorize_fn=categorize_fn, batch_size=10)
+    return RecatWorker(fake, gemini_client=MagicMock(), categorize_fn=categorize_fn, batch_size=10, **kwargs)
 
 
 _TERMINAL = {"done", "error", "cancelled"}
@@ -654,3 +654,36 @@ def test_a_cancel_after_the_last_check_is_not_overwritten_by_done():
     assert row.row["recipe_count"] == 3
     assert row.row["progress_pct"] == 99                 # where it stopped, not 100
     assert worker.run_once() == 0                        # and the worker let go of it
+
+
+def test_a_recategorise_batches_as_the_import_tags():
+    # F-256: ten a call let vegetarian neighbours carry stock-based soups into Vegetarian
+    # (2026-10-05); Apply to existing recipes asks in the import's batches, one number for both.
+    from recipeparser.adapters.recat_worker import RecatWorker
+    from recipeparser.core.stages.tag import TAG_BATCH_SIZE
+
+    assert RecatWorker(MagicMock(), gemini_client=MagicMock())._batch_size == TAG_BATCH_SIZE
+
+
+def test_a_paused_non_exempt_job_waits_held_and_runs_no_batch():
+    fake = _fake_with_job(["running"] * 5, _recipes(25), count=25)
+    cat = MagicMock(return_value={})
+    worker = _worker(fake, cat, ai_allowed=lambda u: False)
+    assert worker.run_once() == 0
+    cat.assert_not_called()
+    assert worker._held is not None, "the job waits, held, for the pause to lift"
+
+
+def test_recat_calls_are_attributed_with_the_jobs_id():
+    from recipeparser import usage
+    seen = []
+
+    def cat(*a, **k):
+        ctx = usage.ai_context.get()
+        seen.append((ctx.user_id, ctx.action, ctx.job_id))
+        return {}
+
+    fake = _fake_with_job(["running"] * 5, _recipes(5), count=5)
+    assert _worker(fake, cat).run_once() == 1
+    assert seen == [("u1", "recat", "j1")]
+    assert usage.ai_context.get() is None

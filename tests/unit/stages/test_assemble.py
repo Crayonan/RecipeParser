@@ -2,7 +2,7 @@
 from recipeparser.core.citation import book_citation, web_citation
 from recipeparser.core.models import SourceMeta
 from recipeparser.core.stages.assemble import assemble
-from recipeparser.models import CayenneRefinement, StructuredIngredient, TokenizedDirection
+from recipeparser.models import CayenneRefinement, RecipePan, StructuredIngredient, TokenizedDirection
 
 
 def _refined() -> CayenneRefinement:
@@ -10,7 +10,7 @@ def _refined() -> CayenneRefinement:
         title="Cake",
         base_servings=2,
         structured_ingredients=[
-            StructuredIngredient(id="ing_01", name="flour", fallback_string="1 cup flour", line_index=0)
+            StructuredIngredient(id="ing_01", kind="ingredient", name="flour", fallback_string="1 cup flour", line_index=0)
         ],
         tokenized_directions=[TokenizedDirection(step=1, text="Mix {{ing_01|flour}}.")],
     )
@@ -112,3 +112,82 @@ def test_the_full_pipeline_hands_assemble_the_four_extracted_fields(monkeypatch)
     src = inspect.getsource(pipeline_mod.RecipePipeline._process_chunk)
     for name in ("total_time", "description", "nutritional_info", "notes"):
         assert f'{name}=getattr(raw, "{name}", None)' in src, name
+
+
+def test_assemble_carries_the_tins_bake_type_and_bake_step():
+    refined = _refined()
+    refined.pans = [RecipePan(id="pan_01", raw="a 20 cm tin", shape="round", family="round-cake")]
+    refined.bake_type = "sponge"
+    refined.bake_step = 0
+    r = assemble(recipe=refined, embedding=[0.0] * 1536, source_url=None, image_url=None, grid_categories={})
+    assert r.pans == refined.pans
+    assert (r.bake_type, r.bake_step) == ("sponge", 0)
+
+
+# --- Cayenne restore (plan B task 3) -----------------------------------------
+
+_SPANS = {
+    "servings_min": 10, "servings_max": 12, "servings_note": "cakes",
+    "prep_min_minutes": 30, "prep_max_minutes": 45, "prep_note": "overnight",
+    "cook_min_minutes": 60, "cook_max_minutes": 90, "cook_note": "slow",
+    "base_servings": 10,
+}
+
+
+def test_assemble_uses_given_spans():
+    r = _assemble(spans=_SPANS, servings_text=None, prep_time="1 hr", cook_time="2 hr")
+    for key, value in _SPANS.items():
+        assert getattr(r, key) == value, key
+
+
+def test_assemble_carries_restore_fields():
+    from recipeparser.core.models import RestoreFields
+
+    r = _assemble(restore=RestoreFields(is_favourite=True, source_uom_system="UK", image_source="generated", stale=True))
+    assert (r.is_favourite, r.source_uom_system, r.image_source, r.stale) == (True, "UK", "generated", True)
+
+
+# --- servings_source (servings at ingest, D44) --------------------------------
+
+
+def test_assemble_sets_servings_source():
+    r = _assemble(servings_text="Serves 2")
+    assert (r.base_servings, r.servings_source) == (2, "stated")
+    r = _assemble(servings_text=None)
+    assert (r.base_servings, r.servings_source) == (2, "estimated")
+
+
+def test_assemble_a_bake_with_a_tin_takes_the_tin():
+    refined = _refined()
+    refined.pans = [RecipePan(id="pan_01", raw="two 20 cm tins", count=2, family="round-cake", dims_mm={"d": 200})]
+    refined.bake_type = "butter-cake"
+    r = assemble(recipe=refined, embedding=[0.0] * 1536, source_url=None, image_url=None, grid_categories={},
+                 servings_text="Makes one cake")
+    assert (r.base_servings, r.servings_source) == (8, "tin")
+
+
+def test_assemble_a_bake_of_one_without_a_tin_takes_the_models_estimate_not_the_one():
+    # "Makes 1 cake" parses to servings_min 1; the estimate is REFINE's, not the yield's count.
+    refined = _refined()
+    refined.base_servings = 10
+    r = assemble(recipe=refined, embedding=[0.0] * 1536, source_url=None, image_url=None, grid_categories={},
+                 servings_text="1 cake")
+    assert (r.base_servings, r.servings_source) == (10, "estimated")
+    assert r.servings_min == 1
+
+
+def test_assemble_a_bake_of_one_with_no_tin_and_no_estimate_leaves_base_servings_null():
+    # The yield's "1" counts the cake: with nothing else, base_servings stays null (the spec's parse
+    # failure) for the next backfill, never the servings_min fallback.
+    refined = _refined()
+    refined.base_servings = None
+    r = assemble(recipe=refined, embedding=[0.0] * 1536, source_url=None, image_url=None, grid_categories={},
+                 servings_text="1 cake")
+    assert (r.base_servings, r.servings_source) == (None, None)
+    assert r.servings_min == 1
+
+
+def test_assemble_given_spans_carries_their_servings_source():
+    r = _assemble(spans={**_SPANS, "servings_source": "tin"})
+    assert (r.base_servings, r.servings_source) == (10, "tin")
+    assert _assemble(spans=_SPANS).servings_source is None
